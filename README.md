@@ -7,10 +7,9 @@ inference-time compute scaling, parameter efficiency, and training
 stability, against matched baselines (looped Transformer, Transformer,
 Gated DeltaNet).
 
-This directory is self-contained so that it can be moved to its own
-repository. It currently holds the plan and specifications; the code
-described in the specs is the next deliverable (see
-`docs/HANDOFF_TASKS.md`).
+This repository is self-contained. It currently holds the plan and
+specifications; the code described in the specs is the next deliverable
+(see `docs/HANDOFF_TASKS.md`).
 
 Read in this order:
 

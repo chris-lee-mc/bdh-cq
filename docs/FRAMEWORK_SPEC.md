@@ -19,7 +19,7 @@ Design principles, in priority order:
 ## 1. Package layout
 
 ```
-bdh-cq-experiments/
+bdh-cq/                     # repository root
   pyproject.toml            # pinned deps, ruff config, pytest config
   bdhx/                     # importable package ("BDH experiments")
     __init__.py
