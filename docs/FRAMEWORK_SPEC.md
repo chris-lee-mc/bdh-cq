@@ -381,3 +381,33 @@ tests:
 
 CI runs `ruff check`, `ruff format --check`, and `pytest -x` on CPU with
 tiny configs. Tests must finish in under 5 minutes on 4 CPU cores.
+
+## 13. Community-code adapter notes (from Phase 0 inspection)
+
+Concrete binding points in `lucidrains/bdh-cq` at commit `c246f890`:
+
+- Ingest: `BDHReasoningWrapper.forward(token_tensor, memories=..., update_memory=..., return_memory=True)`
+  (`bdh_cq.py:463-473`) or `icq.ingest` (`icq.py:134-147`, chunk 128).
+- Reason and answer: `BDHReasoningWrapper.generate(*stages, N, memories=..., num_tokens=..., stop_token=...)`
+  (`bdh_cq.py:604-680`), single sequence only; the adapter adds batching.
+- Reset: pass `memories=None`. `Memory` is an immutable namedtuple and
+  `combine_memories` is out of place (`bdh_cq.py:255-257`), so reuse of
+  an ingested `Memory` across a reasoning-depth sweep is safe today;
+  `test_context_isolation` guards this against future changes.
+- Freeze memory during latent steps: `update_latent_memory=False`.
+- Recurrence count is the int stage; nothing is baked into `__init__`.
+- Community attention residual: `BDH(attn_residual=True, attn_residual_depth_bias_distance=1)`;
+  exposed as `recurrence.kind: attn_residual` and labelled "(community)".
+- The community training loss (latent positions predict the first token
+  of the next segment, `bdh_cq.py:517-522`) is `training.loss: legacy`;
+  `training.loss: final_answer` computes cross-entropy only on the
+  answer tokens after the last latent stage.
+- `share_weights: false` for BDH requires instantiating `depth` separate
+  `BDHBlock`s in the adapter; the community `BDH` cannot do it.
+- Parameter reference points: figure7 config 794,145 params; `icq.py`
+  default 2,370,080; README example 70,811,680.
+
+## 14. Dependency pins
+
+See `EXPERIMENT_PLAN.md` section 15. `uv.lock` is authoritative once the
+package exists; the RunPod image installs from it.
