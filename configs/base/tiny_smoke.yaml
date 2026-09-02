@@ -1,0 +1,9 @@
+# CPU smoke test: runs end to end in under 2 minutes on 4 cores.
+extends: configs/base/default.yaml
+experiment: {name: tiny_smoke, stage: dev, tags: [dev, smoke]}
+model: {params_target: 200_000}
+task: {n_eval_episodes: 32}
+training: {steps: 40, batch_size: 8, checkpoint_every_steps: 20, eval_every_steps: 20}
+reasoning: {train_steps: [1, 2]}
+evaluation: {reasoning_steps: [1, 2, 4], diagnostics: true}
+compute: {device: cpu, deterministic: true, max_wall_clock_minutes: 5}

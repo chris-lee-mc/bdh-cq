@@ -90,7 +90,7 @@ model:
   depth: 4                      # number of distinct layers (1 for shared)
   precision_state: bf16         # recurrent state dtype (H8)
   recurrence:
-    kind: plain                 # plain | residual | step_gate | init_skip | combo
+    kind: plain                 # plain | residual | step_gate | init_skip | step_emb | adapter | attn_residual | combo
     share_weights: true
     input_injection: true       # feed the query embedding at every step
     step_embedding: false
@@ -118,6 +118,7 @@ training:
   schedule: cosine
   grad_clip: 1.0
   precision: bf16               # autocast dtype; fp32 master weights
+  loss: final_answer            # final_answer | legacy (community: latent steps predict next-chunk token)
   checkpoint_every_steps: 1000
   eval_every_steps: 2500
 reasoning:
@@ -202,6 +203,7 @@ injection (present at every step when `input_injection: true`).
 | init_skip | H[r+1] = F(H[r], S) + g[r] * H[0]                | R_max scalars       |
 | step_emb  | H[r+1] = F(H[r] + e[r], S)                       | R_max x width       |
 | adapter   | H[r+1] = F(H[r], S) + A[r] B[r] H[r]  (rank k)    | R_max x 2 x width x k |
+| attn_residual | H[r+1] = softmax-attention of a learned query over {F(H[0]), ..., F(H[r])} with distance-to-end bias (community, `bdh_cq.py:94-146`) | depth x width (tied: width) |
 | combo     | any subset, only after each shows value (Gate C) |                     |
 
 For steps beyond `R_max` (the largest depth seen in training), scalar

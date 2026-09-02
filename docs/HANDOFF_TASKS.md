@@ -100,8 +100,8 @@ Rules while implementing:
 
 ## Stage A
 
-24. LR sweep {1e-4, 3e-4, 1e-3}, 1 seed, compose, for each of BDH,
-    BDH-CQ, looped Transformer at 10M. Record in `RESULTS.md`.
+24. LR sweep `configs/stage_a/a0_lr_sweep.yaml` (1 seed, compose, task
+    seed 2000) for every model at 10M. Record in `RESULTS.md`.
 25. Launch `a1_first_experiment` (18 jobs). Aggregate. Write the A1
     section of `RESULTS.md` with the accuracy-vs-iterations plot and the
     stability classification per model.
@@ -111,7 +111,8 @@ Rules while implementing:
 
 ## Stage B
 
-28. LR sweep for Gated DeltaNet and Transformer at 10M on binding.
+28. Confirm the a0 learning rates transfer to binding for Gated DeltaNet
+    and Transformer (1 seed, task seed 2000); record.
 29. Launch `b1_binding_capacity`, then `b2_memory_robustness`. Write the
     accuracy-vs-associations plot and Gate B finding.
 30. Launch `b3_2x2_interaction` (40 jobs, requires `--allow-large-sweep`
@@ -123,6 +124,11 @@ Rules while implementing:
 31. `c1_recurrence_engineering` with matched controls, then
     `c2_curriculum_and_delay`. Gate C.
 32. `d1_state_precision`. Gate D analysis.
+
+## Stage E (optional, after Gate B)
+
+33. `models/transformer_ttt_lora.py` with per-episode adapter fit and
+    discard; adaptation cost columns. Launch `e1_ttt_control`.
 
 ## After each stage
 

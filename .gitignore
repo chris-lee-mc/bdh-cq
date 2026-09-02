@@ -1,0 +1,8 @@
+results/
+generated/
+reports/
+data/
+runpod_state.jsonl
+*.pt
+__pycache__/
+.venv/

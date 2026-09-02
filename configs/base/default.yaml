@@ -24,6 +24,7 @@ training:
   schedule: cosine
   grad_clip: 1.0
   precision: bf16
+  loss: final_answer
   checkpoint_every_steps: 1000
   eval_every_steps: 2500
 reasoning:

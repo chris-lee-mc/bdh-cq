@@ -4,7 +4,7 @@ sweep:
   stage: C
 base: configs/base/default.yaml
 grid:
-  model.recurrence.kind: [plain, residual, step_gate, init_skip]
+  model.recurrence.kind: [plain, residual, step_gate, init_skip, attn_residual]
   task.name: [compose, propagate]
 seeds: [1, 2, 3]
 overrides:

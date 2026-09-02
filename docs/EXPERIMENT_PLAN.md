@@ -179,9 +179,11 @@ Priority order and how each is obtained:
    6 * hidden^2 parameters constrains width at 10M.
 5. Transformer: same block as the looped Transformer with distinct
    weights per layer, R = 1.
-6. Later: Transformer + LoRA test-time training, protocol borrowed from
-   Akyurek et al. (per-episode rank-8 adapters, discarded after each
-   episode), with adaptation latency and FLOPs recorded.
+6. Later (Stage E, `configs/stage_e/e1_ttt_control.yaml`): Transformer +
+   LoRA test-time training, protocol borrowed from Akyurek et al.
+   (per-episode rank-8 adapters, discarded after each episode), with
+   adaptation latency, FLOPs, memory, interference, and reset cost
+   recorded next to BDH fast memory on the same episodes.
 
 All share the `ReasoningModel` interface in `FRAMEWORK_SPEC.md` section
 3. The interface adds no logic of its own; sequence models see the
@@ -237,6 +239,9 @@ Gate C.
 
 Stage D (precision): fp32, bf16, fp16 state on the Stage C winner.
 Gate D on the R_test > R_train question with deeper analysis if positive.
+
+Stage E (optional, after Gate B): test-time adaptation control, BDH fast
+memory vs LoRA TTT on binding and overwrite.
 
 Scale-up (only after Gates A and B): 25M, then 50M, then 100-150M for
 the one or two comparisons that survived, five seeds.

@@ -1,0 +1,22 @@
+# Second-stage control (lower priority): BDH fast memory vs LoRA test-time
+# training on the same binding episodes.  Runs only after Gate B.
+sweep:
+  name: e1_ttt_control
+  stage: E
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, transformer_ttt_lora]
+  task.name: [binding, overwrite]
+seeds: [1, 2, 3]
+overrides:
+  model.params_target: 10_000_000
+  model.ttt: {rank: 8, steps: 4, lr: 1.0e-3, targets: [q, v, out]}
+  reasoning.train_steps: [1]
+  evaluation.reasoning_steps: [1]
+  evaluation.record_adaptation_cost: true   # latency, FLOPs, memory per episode
+notes: >
+  transformer_ttt_lora ingests demonstrations by fitting a fresh rank-8
+  adapter per episode on the demonstrations (leave-one-out), answers the
+  query, then discards the adapter; reset_context() must remove it.
+  Reported extra columns: adaptation_latency_ms, adaptation_flops,
+  interference_rate (accuracy on episode A after adapting to B without reset).

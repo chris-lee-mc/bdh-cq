@@ -1,0 +1,19 @@
+# Equal hyperparameter effort for every model before any comparison:
+# one seed, one task, three learning rates.  Uses task seed 2000 so the
+# evaluation episodes differ from the Stage A task seed (1000).
+sweep:
+  name: a0_lr_sweep
+  stage: A
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, bdh_cq, looped_transformer, transformer, gated_deltanet]
+  training.lr: [1.0e-4, 3.0e-4, 1.0e-3]
+seeds: [1]
+dev: true                      # exempt from the 3-seed rule; never cited
+overrides:
+  model.params_target: 10_000_000
+  task.name: compose
+  task.seed: 2000
+  training.steps: 20000
+  reasoning.train_steps: [1, 2, 4]
+  evaluation.reasoning_steps: [1, 4]
