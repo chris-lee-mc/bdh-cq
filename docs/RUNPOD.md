@@ -226,19 +226,24 @@ minutes per 10M-parameter, 40k-step run at batch 64 with R_train <= 4 and
 evaluation through R_test = 32. These are planning numbers; the
 profiling step replaces them.
 
+All GPU-hours below use the 50-minute midpoint of that range; USD applies
+the 1.3x contingency on top of the $0.16/hr Community rate.
+
 | sweep | jobs | GPU-hours | USD (with 1.3x contingency) |
 |-------|------|-----------|-----------------------------|
-| A1 first experiment (3 models x 2 tasks x 3 seeds) | 18 | ~15 | ~3.5 |
-| A2 curriculum (2 x 2 x 2 x 3) | 24 | ~20 | ~4.5 |
-| B1 binding capacity (3 x 3) | 9 | ~6 | ~1.5 |
-| B2 memory robustness (3 x 3 x 3) | 27 | ~18 | ~4 |
-| B3 2x2 interaction (2 x 2 x 2 x 5) | 40 | ~35 | ~8 |
-| C1 recurrence engineering (4 kinds + 2 controls) x 2 tasks x 3 seeds | 36 | ~35 | ~8 |
-| D1 precision (3 x 2 x 3) | 18 | ~15 | ~3.5 |
+| A1 first experiment (3 models x 2 tasks x 3 seeds) | 18 | ~15 | ~3 |
+| A2 curriculum (2 x 2 x 2 x 3) | 24 | ~20 | ~4 |
+| B1 binding capacity (3 x 3) | 9 | ~7.5 | ~1.5 |
+| B2 memory robustness (3 x 3 x 3) | 27 | ~22.5 | ~4.5 |
+| B3 2x2 interaction (2 x 2 x 2 x 5) | 40 | ~33.5 | ~7 |
+| C1 recurrence engineering (7 kinds + 5 matched controls) x 2 tasks x 3 seeds, requires `--allow-large-sweep` | 72 | ~60 | ~12.5 |
+| C2 curriculum and delay (2 x 2 x 2 x 3) | 24 | ~20 | ~4 |
+| D1 precision (3 x 2 x 3) | 18 | ~15 | ~3 |
 
-Even with a 3x error the whole initial programme is well under $150 on
-Community Cloud. The scale-up phases (25M, 50M, 100-150M) are budgeted
-separately after Gate A and Gate B.
+Total, Stages A-D: about 195 GPU-hours, about $40 with contingency. Even
+with a 3x error the whole initial programme is well under $150 on
+Community Cloud. The scale-up phases (S1 at 2M-25M, then 50M, then
+100-150M) are budgeted separately after Gate A and Gate B.
 
 ## 9. Alternatives (one paragraph each)
 

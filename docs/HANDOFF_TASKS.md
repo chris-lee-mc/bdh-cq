@@ -121,8 +121,9 @@ Rules while implementing:
 
 ## Stage C and D
 
-31. `c1_recurrence_engineering` with matched controls, then
-    `c2_curriculum_and_delay`. Gate C.
+31. `c1_recurrence_engineering` with matched controls (72 jobs, requires
+    `--allow-large-sweep`), then `c2_curriculum_and_delay` (24 jobs).
+    Gate C.
 32. `d1_state_precision`. Gate D analysis.
 
 ## Stage E (optional, after Gate B)

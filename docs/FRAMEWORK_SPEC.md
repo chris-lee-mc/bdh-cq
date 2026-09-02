@@ -34,6 +34,8 @@ bdh-cq-experiments/
       looped_transformer.py # shared-block Transformer with input injection
       transformer.py        # fixed-depth Transformer
       gated_deltanet.py     # adapter over fla.layers.GatedDeltaNet + CPU fallback
+      unified_block.py      # shared block family for the H3 2x2 (memory kind x recurrence, one width solver)
+      transformer_ttt_lora.py # Transformer + per-episode rank-k LoRA test-time training (Stage E)
       recurrence.py         # recurrence engineering variants (H5-H7)
       param_budget.py       # width solver to hit params_target
     tasks/
@@ -58,9 +60,13 @@ bdh-cq-experiments/
     profile_config.py
     runpod_launch.py        # optional; needs RUNPOD_API_KEY
     collect_results.py
+    sync_checkpoint.py      # upload local checkpoint/results to the S3 bucket
+    fetch_latest_checkpoint.py # download latest.json + checkpoint for --resume
   configs/
     base/*.yaml             # model/task/training defaults
     stage_a/*.yaml stage_b/*.yaml stage_c/*.yaml stage_d/*.yaml
+    stage_e/*.yaml          # optional, after Gate B
+    scaleup/*.yaml          # parameter-scale sweeps, after Gates A and B
   docker/
     Dockerfile  entrypoint.sh
   tests/
@@ -98,6 +104,7 @@ model:
   memory:
     kind: bdh                   # bdh | none | kv | gated_deltanet
     reset_per_episode: true     # MUST be true unless persistent_memory experiment
+  ttt: null                     # transformer_ttt_lora only; see the Stage E block below
 task:
   name: compose
   seed: 1000
@@ -130,6 +137,8 @@ reasoning:
 evaluation:
   reasoning_steps: [1, 2, 4, 8, 16, 32, 64]
   diagnostics: true
+  record_adaptation_cost: false # Stage E only; adds adaptation_latency_ms,
+                                 # adaptation_flops, interference_rate columns
 compute:
   device: auto
   deterministic: false          # true costs ~10-30 percent; used for tests
@@ -148,7 +157,20 @@ Rules:
 - `generate_sweep.py` expands a sweep YAML (`grid:` and `seeds:` keys)
   into one fully-resolved config per job in `generated/<sweep>/exp_NNN.yaml`
   plus `generated/<sweep>/manifest.csv` listing config hash, seed, and
-  estimated GPU-minutes.
+  estimated GPU-minutes. Sweep-file-only keys (`sweep`, `base`, `grid`,
+  `seeds`, `dev`, `overrides`, `controls`, `notes`) are documented in
+  `configs/README.md`.
+- A plain (non-sweep) config may set `extends: <path>` to load another
+  config first and apply this file's keys as overrides on top of it, the
+  same override semantics `generate_sweep.py` uses for `overrides:`
+  (`configs/base/tiny_smoke.yaml` extends `configs/base/default.yaml`).
+  `extends` is resolved before hashing; the hash covers the fully
+  resolved config, not the `extends` pointer.
+- `model.ttt: {rank, steps, lr, targets}` configures
+  `models/transformer_ttt_lora.py`: `rank` and `steps` are the per-episode
+  LoRA adapter rank and gradient steps, `lr` its inner-loop learning rate,
+  `targets` the projection names it adapts (e.g. `[q, v, out]`). Null for
+  every other model.
 
 ## 3. Common model interface
 
@@ -243,19 +265,41 @@ FLOPs per reasoning depth are recorded per evaluation.
 {
   "run_id": "...", "config_hash": "...", "seed": 1,
   "model": "bdh_cq", "task": "compose", "params": 10023456,
+  "gate_extrapolation": "hold_last",
   "evaluations": [
     {"step": 50000, "reasoning_steps": 8, "split": "strong",
      "difficulty": {"depth": 6}, "n_episodes": 1000,
      "exact_match": 0.412, "token_acc": 0.77,
      "inference_flops_per_episode": 1.2e9, "latency_ms_per_episode": 3.1,
+     "task_metrics": {"stale_rate": 0.08, "other_rate": 0.02,
+                      "distractor_answer_rate": 0.01, "first_rate": 0.1,
+                      "last_rate": 0.85, "partial_depth_acc": 0.6,
+                      "cell_acc": 0.9, "max_correct_distance": 7,
+                      "first_error_position": 4},
+     "adaptation": {"adaptation_latency_ms": 12.4, "adaptation_flops": 3.1e7,
+                    "interference_rate": 0.05},
      "diagnostics": {"state_norm": [...], "update_norm": [...],
-                     "cos_consecutive": [...], "nan_count": 0}}
+                     "cos_consecutive": [...], "active_neuron_frac": [...],
+                     "activation_percentiles": [...],
+                     "jacobian_eigenvalue_estimate": [...], "nan_count": 0}}
   ],
   "training_curve": "train_log.csv"
 }
 ```
 
-One row per (step, reasoning_steps, split, difficulty). `train_log.csv`
+One row per (step, reasoning_steps, split, difficulty). `task_metrics`
+holds whatever `task.score()` returns beyond `exact_match`/`token_acc`
+(each task in `TASK_SUITE_SPEC.md` section 2 defines its own subset, e.g.
+`stale_rate` for overwrite, `distractor_answer_rate` for distractors).
+`adaptation` is present only when `evaluation.record_adaptation_cost` is
+true (Stage E, `transformer_ttt_lora`). `gate_extrapolation` records
+whether recurrence-kind gates/embeddings beyond `R_max` hold the last
+trained value or interpolate (section 3.1).
+`jacobian_eigenvalue_estimate` is populated only at `reasoning_steps` in
+{8, 32} per the evaluation protocol below; empty elsewhere. The
+interaction term for a 2x2 design (H3) is not stored per run; it is
+computed by `aggregate.py` from the four cells' `exact_match` means and
+reported with a bootstrap interval in `summary.csv`. `train_log.csv`
 has `step, loss, lr, grad_norm, r_train, examples_seen, wall_s, vram`.
 
 ## 6. Evaluation protocol (`evaluate.py`)
@@ -267,10 +311,15 @@ has `step, loss, lr, grad_norm, r_train, examples_seen, wall_s, vram`.
 - Records latency with `torch.cuda.synchronize` around `solve`.
 - With `diagnostics: true`, `solve(collect_diagnostics=True)` returns per
   step: `||H[r]||`, `||H[r+1]-H[r]||`, `cos(H[r+1], H[r])`, fraction of
-  active neurons (BDH sparsity), NaN/Inf counts, and the top-k eigenvalue
-  magnitude estimate of the step Jacobian via 5 power-iteration steps on a
-  random probe (only at `reasoning_steps` in {8, 32}, only for 32
-  episodes, to bound cost).
+  active neurons (BDH sparsity, `active_neuron_frac`), an activation
+  distribution summary (`activation_percentiles`: 5/25/50/75/95 of the
+  per-neuron activation magnitude), NaN/Inf counts, and the top-k
+  eigenvalue magnitude estimate of the step Jacobian
+  (`jacobian_eigenvalue_estimate`) via 5 power-iteration steps on a random
+  probe (only at `reasoning_steps` in {8, 32}, only for 32 episodes, to
+  bound cost). Gradient norms are a training-time, not evaluation-time,
+  diagnostic: `trainer.py` logs `grad_norm` per step in `train_log.csv`
+  (section 5); recurrent-stability read-outs combine both series.
 - Also evaluates at intermediate checkpoints (`eval_every_steps`) with a
   reduced depth list `[1, 4, 16]` to produce learning curves.
 

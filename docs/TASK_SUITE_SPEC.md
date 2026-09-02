@@ -92,8 +92,9 @@ symbol tokens; `->` denotes a demonstration pair.
   value. Also emit `stale_target` for scoring "old-answer rate".
 - Knobs: `n_bindings`, `n_overwrites`, `gap` (number of demonstrations
   between the original and the overwrite).
-- Train: `n_bindings` <= 8, `n_overwrites` <= 2, `gap` <= 4. Mild: `gap`
-  8-16. Strong: `n_overwrites` up to `n_bindings`, `gap` up to 32.
+- Train: `n_bindings` <= 8, `n_overwrites` <= 2, `gap` <= 4. Interp: same.
+  Mild: `gap` 8-16. Strong: `n_overwrites` up to `n_bindings`, `gap` up
+  to 32.
 - Metrics: exact match, `stale_rate` (fraction answering the old value),
   `other_rate`.
 - Isolates: whether memory implements recency-correct overwrite (H2).
@@ -103,7 +104,7 @@ symbol tokens; `->` denotes a demonstration pair.
 - Generator: as T1 plus `m` distractor demonstrations whose keys never
   appear in any query. Distractors are interleaved uniformly at random.
 - Knobs: `n_bindings`, `distractor_ratio` = m/n in {0, 0.5, 1, 2, 4, 8}.
-- Train: ratio <= 1. Mild: 2. Strong: 4, 8.
+- Train: ratio <= 1. Interp: same. Mild: 2. Strong: 4, 8.
 - Metric: exact match vs ratio; also `distractor_answer_rate` (answered
   with a distractor's value).
 - Isolates: interference under memory load (H2).
@@ -116,6 +117,8 @@ symbol tokens; `->` denotes a demonstration pair.
   identical to T2) or `majority` (emit 3 demos per key, 2 agree). Default
   reported convention is `recency`; `majority` is a secondary probe.
 - Knobs: `n_bindings`, `n_conflicts`, `convention`.
+- Train: `n_bindings` <= 8, `n_conflicts` <= 2. Interp: same. Mild:
+  `n_conflicts` 3-4. Strong: `n_conflicts` up to `n_bindings`.
 - Metrics: exact match under the convention, `first_rate`, `last_rate`.
 - Isolates: recency vs frequency behaviour of the memory (H2).
 
@@ -148,8 +151,8 @@ symbol tokens; `->` denotes a demonstration pair.
   episode.
 - Knobs: `length` L, `max_propagation_distance` (train small),
   `n_sources`, `dim` (1 or 2).
-- Train: distance <= 4, L <= 12. Mild: distance 6-8. Strong: distance
-  12-24, L up to 48.
+- Train: distance <= 4, L <= 12. Interp: same. Mild: distance 6-8.
+  Strong: distance 12-24, L up to 48.
 - Metric: exact match on the grid; `cell_acc`; `max_correct_distance`.
 - Isolates: iterative local rule that needs roughly one step per unit
   distance; the canonical "does R_test > R_train help" task (H4).
@@ -158,7 +161,8 @@ symbol tokens; `->` denotes a demonstration pair.
 
 - Generator: random symbol string of length L; demonstrations show copy on
   2-3 short strings; query is a fresh string; target is the same string.
-- Knobs: `length` L. Train L in [2, 8]. Mild [9, 16]. Strong [17, 64].
+- Knobs: `length` L. Train L in [2, 8]. Interp: same. Mild [9, 16].
+  Strong [17, 64].
 - Metric: exact match, token accuracy, `first_error_position`.
 - Isolates: length generalization and positional dependence.
 
@@ -169,7 +173,8 @@ symbol tokens; `->` denotes a demonstration pair.
   this subset". Target: the correct comparison / sorted sequence.
 - Knobs: `n_items`, `query_type` in {pair, sort}, `chain_gap` (how many
   hops separate the queried pair).
-- Train: `n_items` <= 6, hops <= 2. Mild: hops 3-4. Strong: hops 6-12.
+- Train: `n_items` <= 6, hops <= 2. Interp: same. Mild: hops 3-4. Strong:
+  hops 6-12.
 - Metric: exact match vs hops.
 - Isolates: transitive multi-hop inference over in-context relations.
 
@@ -180,7 +185,8 @@ symbol tokens; `->` denotes a demonstration pair.
   drop-last). Demonstrations show each primitive individually (as in T5).
   Query gives a nesting program of depth k, encoded as a bracketed
   sequence of primitive tags, and an input; target is the result.
-- Knobs: `depth` k. Train {1, 2}. Mild {3, 4}. Strong {5, 6, 8}.
+- Knobs: `depth` k. Train {1, 2}. Interp: same. Mild {3, 4}. Strong
+  {5, 6, 8}.
 - Metric: exact match vs depth.
 - Isolates: composition of in-context and learned primitives; a harder
   cousin of T5.

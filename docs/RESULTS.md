@@ -26,8 +26,9 @@ See `docs/PHASE0_REPRODUCTION.md` for the record of the reproduction run
 
 ## Stage A: recurrence behaviour
 
-Question: can BDH-CQ (and BDH, looped Transformer) learn an iterative
-algorithm that benefits from more test-time loops than it saw in training?
+Question: can BDH-CQ (community) (and BDH, looped Transformer) learn an
+iterative algorithm that benefits from more test-time loops than it saw
+in training?
 
 Gate A finding: pending.
 

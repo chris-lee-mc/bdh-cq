@@ -1,0 +1,19 @@
+# Scale-up S1: does the Stage A/B winner's advantage hold as params grow?
+# Only launched after Gate A and Gate B pass. Update model.name and
+# task.name below to the comparison that survived before running.
+sweep:
+  name: s1_params_sweep
+  stage: scaleup
+base: configs/base/default.yaml
+grid:
+  model.params_target: [2_000_000, 5_000_000, 10_000_000, 25_000_000]
+seeds: [1, 2, 3, 4, 5]
+overrides:
+  model.name: bdh_cq
+  task.name: compose
+  reasoning.train_steps: [1, 2, 4]
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+notes: >
+  Five seeds per cell, matching the README-grade seed policy
+  (EXPERIMENT_PLAN.md section 9). 50M and 100-150M cells follow in later
+  scaleup sweep files once this stage confirms the trend continues.

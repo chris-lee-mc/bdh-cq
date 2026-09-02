@@ -70,6 +70,8 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H1. Recurrent latent reasoning helps independently of BDH memory
 
+- Config: `configs/stage_a/a1_first_experiment.yaml`, extended by
+  `configs/stage_a/a3_rtrain_sweep.yaml`.
 - Compare: BDH + recurrence (R_train in {1,2,4}) vs BDH with matched
   non-recurrent compute (unshared depth chosen to match FLOPs at R=4) vs
   looped Transformer with identical recurrence schedule.
@@ -82,6 +84,8 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H2. BDH contextual memory provides capabilities beyond ordinary attention
 
+- Config: `configs/stage_b/b1_binding_capacity.yaml`,
+  `configs/stage_b/b2_memory_robustness.yaml`.
 - Compare: BDH memory vs Transformer KV attention vs Gated DeltaNet, all
   at R=1, matched, on binding, overwrite, distractors, contradict.
 - Metric: exact match vs number of bindings; stale rate on overwrite;
@@ -96,6 +100,7 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H3. Memory and recurrence interact positively (2x2)
 
+- Config: `configs/stage_b/b3_2x2_interaction.yaml`.
 - Cells: {KV context, BDH context} x {fixed depth, recurrent depth}, one
   block family (`unified_block`) so only those two variables change.
   Params matched by width solver; FLOPs matched by step count.
@@ -106,6 +111,8 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H4. The model uses additional inference-time reasoning
 
+- Config: `configs/stage_a/a1_first_experiment.yaml`,
+  `configs/stage_a/a3_rtrain_sweep.yaml`.
 - Train at R_train in {1,2,4}; evaluate R_test in {1,2,4,8,16,32,64}.
 - Metric: accuracy vs R_test per split; classify each curve as
   improving, saturating, or degrading beyond R_train_max using the slope
@@ -119,6 +126,8 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H5. A recurrence curriculum improves stability
 
+- Config: `configs/stage_a/a2_curriculum.yaml`,
+  `configs/stage_c/c2_curriculum_and_delay.yaml`.
 - Compare: fixed R=8; curriculum 1 -> 2 -> 4 -> 8 at 0, 25, 50, 75
   percent of steps; delayed start (R=1 for the first 30 percent, then the
   curriculum). Parameter Golf records introduced recurrence partway
@@ -131,6 +140,9 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H6. Small per-iteration degrees of freedom help shared recurrence
 
+- Config: `configs/stage_c/c1_recurrence_engineering.yaml`
+  (`recurrence.kind` in {step_gate, step_emb, adapter}, each with its
+  matched plain control via `controls.matched_controls`).
 - Compare: plain vs step_gate (R_max scalars) vs step_emb vs rank-4
   adapter, each against a plain control with the same extra parameter
   budget added to width.
@@ -142,6 +154,8 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H7. Initial-state skips reduce recurrent drift
 
+- Config: `configs/stage_c/c1_recurrence_engineering.yaml`
+  (`recurrence.kind` in {residual, init_skip, attn_residual}).
 - Compare: plain, residual, init_skip (gated H[0] injection), and the
   community attention residual.
 - Metric: cosine similarity between H[r] and H[0] projected onto the
@@ -151,6 +165,7 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 ### H8. Recurrent-state precision matters
 
+- Config: `configs/stage_d/d1_state_precision.yaml`.
 - Compare: fp32, bf16, fp16 state dtype with fp32 accumulation, on the
   best Stage C configuration.
 - Metric: accuracy vs R_test; per-iteration update norm; NaN incidence.
@@ -163,27 +178,35 @@ training FLOPs within 15 percent, as enforced by the aggregator.
 
 Priority order and how each is obtained:
 
-1. BDH: adapter over the community `BDHBlock` and `BDH`, plus a
-   `share_weights: false` path that instantiates `depth` blocks.
-2. BDH-CQ (community): adapter over `BDHReasoningWrapper`, batched
-   decoding added (numerically equal to sequential; tested).
-3. Looped Transformer: own ~200-line implementation, pre-norm block with
-   RoPE and SwiGLU, shared across R, input injection of the embedded
-   sequence at each step, same recurrence kinds as BDH. Sandwich norm as
-   a config option (the Ouro reimplementation reports it as critical for
-   recurrent stability).
-4. Gated DeltaNet: `fla.layers.GatedDeltaNet` (flash-linear-attention
-   0.5.2, MIT) on GPU; a hand-written O(T) recurrent reference in pure
-   PyTorch for CPU tests and for numerical parity checks against the
-   Triton kernel at small sizes. Note the per-layer budget of about
-   6 * hidden^2 parameters constrains width at 10M.
-5. Transformer: same block as the looped Transformer with distinct
-   weights per layer, R = 1.
-6. Later (Stage E, `configs/stage_e/e1_ttt_control.yaml`): Transformer +
-   LoRA test-time training, protocol borrowed from Akyurek et al.
-   (per-episode rank-8 adapters, discarded after each episode), with
-   adaptation latency, FLOPs, memory, interference, and reset cost
-   recorded next to BDH fast memory on the same episodes.
+1. BDH (`model.name: bdh`): adapter over the community `BDHBlock` and
+   `BDH`, plus a `share_weights: false` path that instantiates `depth`
+   blocks.
+2. BDH-CQ (community) (`model.name: bdh_cq`): adapter over
+   `BDHReasoningWrapper`, batched decoding added (numerically equal to
+   sequential; tested).
+3. Looped Transformer (`model.name: looped_transformer`): own ~200-line
+   implementation, pre-norm block with RoPE and SwiGLU, shared across R,
+   input injection of the embedded sequence at each step, same recurrence
+   kinds as BDH. Sandwich norm as a config option (the Ouro reimplementation
+   reports it as critical for recurrent stability).
+4. Gated DeltaNet (`model.name: gated_deltanet`): `fla.layers.GatedDeltaNet`
+   (flash-linear-attention 0.5.2, MIT) on GPU; a hand-written O(T)
+   recurrent reference in pure PyTorch for CPU tests and for numerical
+   parity checks against the Triton kernel at small sizes. Note the
+   per-layer budget of about 6 * hidden^2 parameters constrains width at
+   10M.
+5. Transformer (`model.name: transformer`): same block as the looped
+   Transformer with distinct weights per layer, R = 1.
+6. Later (Stage E, `configs/stage_e/e1_ttt_control.yaml`):
+   `model.name: transformer_ttt_lora`, Transformer + LoRA test-time
+   training, protocol borrowed from Akyurek et al. (per-episode rank-8
+   adapters, discarded after each episode), with adaptation latency,
+   FLOPs, memory, interference, and reset cost recorded next to BDH fast
+   memory on the same episodes.
+7. H3 only (Stage B, `configs/stage_b/b3_2x2_interaction.yaml`):
+   `model.name: unified_block`, one shared block family used for all four
+   cells of the memory-kind x recurrence 2x2 so that memory kind and
+   recurrence depth are the only variables changing (section 3, H3).
 
 All share the `ReasoningModel` interface in `FRAMEWORK_SPEC.md` section
 3. The interface adds no logic of its own; sequence models see the
@@ -232,10 +255,10 @@ Stage B (memory), ~10M params, R = 1 except B3:
 - Gate B.
 
 Stage C (recurrence engineering) on the best A configuration: plain,
-residual, step_gate, init_skip, attention residual (community), each
-against the same baseline with matched controls; then curriculum and
-delayed start (C2). Combine only mechanisms that won individually.
-Gate C.
+residual, step_gate, init_skip, step_emb, rank-4 adapter, attention
+residual (community), each against the same baseline with matched
+controls; then curriculum and delayed start (C2). Combine only
+mechanisms that won individually. Gate C.
 
 Stage D (precision): fp32, bf16, fp16 state on the Stage C winner.
 Gate D on the R_test > R_train question with deeper analysis if positive.
@@ -243,12 +266,23 @@ Gate D on the R_test > R_train question with deeper analysis if positive.
 Stage E (optional, after Gate B): test-time adaptation control, BDH fast
 memory vs LoRA TTT on binding and overwrite.
 
-Scale-up (only after Gates A and B): 25M, then 50M, then 100-150M for
-the one or two comparisons that survived, five seeds.
+### Scale-up sweeps
+
+Only survivors of Gate A and Gate B scale past 10M; nothing scales on a
+comparison that did not clear both gates. Rule: five seeds per cell, same
+matching and reporting conventions as Stages A-D.
+
+- S1 params sweep: `configs/scaleup/s1_params_sweep.yaml`,
+  `model.params_target` in {2_000_000, 5_000_000, 10_000_000, 25_000_000},
+  five seeds, to check the trend holds below and around the Stage A-D
+  scale before spending on larger runs.
+- Then 50M, then 100-150M for the one or two comparisons that survived,
+  five seeds, in later sweep files.
 
 Compute per stage is estimated in `RUNPOD.md` section 8 and replaced by
-profiling before launch. The whole initial programme is under about 150
-GPU-hours on RTX A5000 Community.
+profiling before launch. The whole initial programme (Stages A-D) is
+about 195 GPU-hours on RTX A5000 Community, under $50 with contingency;
+scale-up is budgeted separately after Gates A and B.
 
 ## 8. Matched controls and compute accounting
 
@@ -360,7 +394,7 @@ distractor, and contradiction curves.
 
 Initial development on CPU (tiny configs, tests). Sweeps on RTX A5000 or
 RTX 4090 Community Cloud, one job per GPU, seeds as separate jobs.
-Planning estimate for Stages A-D at 10M: about 150 GPU-hours, under $50
+Planning estimate for Stages A-D at 10M: about 195 GPU-hours, under $50
 at Community prices with contingency. Scale-up budgeted after gates.
 
 ## 15. Dependency pins (to be locked in `pyproject.toml` and `uv.lock`)
