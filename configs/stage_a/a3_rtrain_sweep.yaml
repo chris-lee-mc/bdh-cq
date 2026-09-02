@@ -1,0 +1,14 @@
+# Stage A, experiment A3: R_train as a variable (1, 2, 4, 8) on three tasks.
+sweep:
+  name: a3_rtrain_sweep
+  stage: A
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh_cq, looped_transformer]
+  task.name: [compose, propagate, nested]
+  reasoning.train_steps: [[1], [2], [4], [8]]
+seeds: [1, 2, 3]
+overrides:
+  model.params_target: 10_000_000
+  reasoning.train_step_sampling: fixed
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32, 64]

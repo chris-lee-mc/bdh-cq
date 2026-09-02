@@ -1,0 +1,19 @@
+# Stage C: each recurrence modification individually vs the same baseline.
+sweep:
+  name: c1_recurrence_engineering
+  stage: C
+base: configs/base/default.yaml
+grid:
+  model.recurrence.kind: [plain, residual, step_gate, init_skip]
+  task.name: [compose, propagate]
+seeds: [1, 2, 3]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  reasoning.train_steps: [1, 2, 4]
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32, 64]
+  evaluation.diagnostics: true
+controls:
+  # For kinds that add parameters, a plain control with the same extra
+  # budget is generated automatically by generate_sweep.py (--matched-controls).
+  matched_controls: true

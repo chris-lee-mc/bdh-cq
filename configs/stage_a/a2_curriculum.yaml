@@ -1,0 +1,16 @@
+# Stage A, experiment A2: repeat A1 with a recurrence curriculum.
+sweep:
+  name: a2_curriculum
+  stage: A
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh_cq, looped_transformer]
+  task.name: [compose, propagate]
+  reasoning.train_step_sampling: [uniform, curriculum]
+seeds: [1, 2, 3]
+overrides:
+  model.params_target: 10_000_000
+  training.steps: 40000
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.curriculum: {schedule: [1, 2, 4], switch_at: [0.0, 0.3, 0.6]}
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]

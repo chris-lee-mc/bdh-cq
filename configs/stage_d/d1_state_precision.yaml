@@ -1,0 +1,14 @@
+sweep:
+  name: d1_state_precision
+  stage: D
+base: configs/base/default.yaml
+grid:
+  model.precision_state: [fp32, bf16, fp16]
+  task.name: [compose, propagate]
+seeds: [1, 2, 3]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  reasoning.train_steps: [1, 2, 4]
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32, 64]
+  evaluation.diagnostics: true

@@ -1,0 +1,15 @@
+sweep:
+  name: c2_curriculum_and_delay
+  stage: C
+base: configs/base/default.yaml
+grid:
+  reasoning.train_step_sampling: [fixed, curriculum]
+  reasoning.delayed_start_fraction: [0.0, 0.3]
+  task.name: [compose, propagate]
+seeds: [1, 2, 3]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  reasoning.train_steps: [8]
+  reasoning.curriculum: {schedule: [1, 2, 4, 8], switch_at: [0.0, 0.25, 0.5, 0.75]}
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32, 64]

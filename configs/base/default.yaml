@@ -1,0 +1,38 @@
+experiment: {name: default, stage: dev, tags: []}
+model:
+  name: bdh_cq
+  params_target: 10_000_000
+  width: null
+  depth: 1
+  precision_state: bf16
+  recurrence: {kind: plain, share_weights: true, input_injection: true, step_embedding: false, adapter_rank: 0}
+  memory: {kind: bdh, reset_per_episode: true}
+task:
+  name: compose
+  seed: 1000
+  train_difficulties: null        # null = task default (TASK_SUITE_SPEC.md)
+  eval_difficulties: null
+  n_eval_episodes: 1000
+training:
+  steps: 40000
+  batch_size: 64
+  seed: 1
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  warmup_steps: 1000
+  schedule: cosine
+  grad_clip: 1.0
+  precision: bf16
+  checkpoint_every_steps: 1000
+  eval_every_steps: 2500
+reasoning:
+  train_steps: [1, 2, 4]
+  train_step_sampling: uniform
+  curriculum: null
+  delayed_start_fraction: 0.0
+  backprop_through_all_steps: true
+evaluation:
+  reasoning_steps: [1, 2, 4, 8, 16, 32, 64]
+  diagnostics: true
+compute: {device: auto, deterministic: false, max_wall_clock_minutes: 180}

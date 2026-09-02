@@ -1,0 +1,13 @@
+# Stage B, experiment B2: overwrite, distractors, contradictions.
+sweep:
+  name: b2_memory_robustness
+  stage: B
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, gated_deltanet, transformer]
+  task.name: [overwrite, distractors, contradict]
+seeds: [1, 2, 3]
+overrides:
+  model.params_target: 10_000_000
+  reasoning.train_steps: [1]
+  evaluation.reasoning_steps: [1]

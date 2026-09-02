@@ -1,0 +1,18 @@
+# Stage B, experiment B1: is BDH memory special?  Capacity curve.
+sweep:
+  name: b1_binding_capacity
+  stage: B
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, gated_deltanet, transformer]
+seeds: [1, 2, 3]
+overrides:
+  model.params_target: 10_000_000
+  task.name: binding
+  task.train_difficulties: [{n_bindings: 1}, {n_bindings: 2}, {n_bindings: 4}, {n_bindings: 8}]
+  task.eval_difficulties:
+    interp: [{n_bindings: 1}, {n_bindings: 2}, {n_bindings: 4}, {n_bindings: 8}]
+    mild:   [{n_bindings: 16}]
+    strong: [{n_bindings: 32}, {n_bindings: 64}]
+  reasoning.train_steps: [1]
+  evaluation.reasoning_steps: [1]

@@ -1,0 +1,31 @@
+# Stage A, experiment A1: the first high-priority question.
+# Can BDH-CQ learn an iterative algorithm that benefits from more test-time
+# loops than it saw in training?  One variable per row of the grid.
+sweep:
+  name: a1_first_experiment
+  stage: A
+  description: >
+    BDH vs BDH-CQ vs looped Transformer at ~10M params on compose and
+    propagate; R_train sampled from {1,2,4}; evaluate R_test 1..32.
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, bdh_cq, looped_transformer]
+  task.name: [compose, propagate]
+seeds: [1, 2, 3]            # raise to [1,2,3,4,5] for README-grade claims
+overrides:
+  model.params_target: 10_000_000
+  model.recurrence.kind: plain
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 40000
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+  evaluation.diagnostics: true
+notes: >
+  'bdh' here is the non-recurrent baseline: reasoning.train_steps is
+  forced to [1] and evaluation.reasoning_steps to [1] by the model adapter
+  (it has no loop); the row exists so the plot shows the fixed-depth
+  reference. Its params_target is matched to the recurrent models.

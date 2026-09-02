@@ -1,0 +1,20 @@
+# H3: 2x2 context mechanism x reasoning mechanism, matched params/FLOPs.
+sweep:
+  name: b3_2x2_interaction
+  stage: B
+base: configs/base/default.yaml
+grid:
+  model.memory.kind: [kv, bdh]
+  reasoning.train_steps: [[1], [1, 2, 4]]
+  task.name: [compose, binding]
+seeds: [1, 2, 3, 4, 5]
+overrides:
+  model.name: unified_block        # one block family; memory kind and recurrence are the only variables
+  model.params_target: 10_000_000
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+notes: >
+  The fixed-depth cells (train_steps [1]) are given depth 4 distinct layers
+  and the recurrent cells depth 1 shared layer applied R times, with widths
+  solved so params match; train FLOPs are matched by setting the fixed-depth
+  cells' step count so that total training FLOPs agree within 15 percent.
+  Both matching choices are recorded and flagged in the table.
