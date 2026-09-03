@@ -4,13 +4,20 @@ Every function that talks to RunPod takes a `client` argument (default: the
 real `runpod` module) so tests can pass a fake with the same attribute names
 (`create_pod`, `get_pod`, `get_pods`, `terminate_pod`, `api_key`).
 
-No S3 bucket is configured for this project yet (`tools/sync_checkpoint.py`
-does not exist; `run_experiment.py --sync-bucket` is a stub). Instead of the
-S3 protocol in RUNPOD.md section 3, jobs write to /workspace/runs/<run_id>
-on the pod's own disk and `collect` pulls it over SSH/scp before the pod is
-terminated. This means a job that is preempted before `collect` runs loses
-its progress beyond the last local checkpoint on that pod's disk -- there is
-no off-pod copy until collect runs. Say this plainly in any run report.
+Default (no S3): jobs write to /workspace/runs/<run_id> on the pod's own disk
+and `collect` pulls it over SSH/scp before the pod is terminated. A job that
+is preempted before `collect` runs loses its progress beyond the last local
+checkpoint on that pod's disk -- there is no off-pod copy until collect runs.
+Say this plainly in any run report. This is still the default because no S3
+bucket is configured for this project.
+
+Opt-in (`--s3-bucket`): the RUNPOD.md section 3 protocol is used instead, via
+`tools/fetch_latest_checkpoint.py` before training and
+`run_experiment.py --sync-bucket` during it, so every checkpoint lands off the
+pod as it is written and a preemption costs only the work since the last
+upload. Credentials are forwarded from the launcher's own environment (see
+`s3_env`), never stored in a config or the state file. Untested against a real
+bucket: no S3 credentials exist for this project yet.
 
 Usage:
     python tools/runpod_launch.py estimate generated/a1_first_experiment
@@ -196,14 +203,32 @@ def latest_state_by_run_id(state_path: Path = DEFAULT_STATE_FILE) -> dict[str, d
 # -- launch -----------------------------------------------------------------
 
 
-def build_docker_args(cfg: PodRecord, git_ref: str) -> str:
+def build_docker_args(cfg: PodRecord, git_ref: str, *, s3_bucket: str | None = None) -> str:
     """Startup command for the stock runpod/pytorch image (no Dockerfile needed).
 
     Deliberately does not embed RUNPOD_API_KEY or self-terminate: the account's
     master key is not distributed to every pod. Termination is the launcher's
     job (collect --terminate-on-collect, or watchdog/reap).
+
+    `s3_bucket` is opt-in and off by default. Without it (the only mode in use
+    today, since no bucket is configured) the command is byte-for-byte what it
+    has always been: train to local disk, collect over scp. With it, the job
+    additionally follows the RUNPOD.md section 3 protocol -- fetch the run's
+    latest checkpoint before training, and sync every checkpoint off the pod
+    during it -- so a preemption costs at most the work since the last upload
+    instead of everything since the last `collect`. The credentials that go
+    with the bucket are passed through `create_pod(env=...)`, never baked in
+    here; see `s3_env`.
     """
     out_dir = f"/workspace/runs/{cfg.run_id}"
+    fetch = ""
+    sync = ""
+    if s3_bucket:
+        fetch = (
+            f"python tools/fetch_latest_checkpoint.py --bucket {s3_bucket} "
+            f"--run-id {cfg.run_id} --dest {out_dir} --config {cfg.config_path} && "
+        )
+        sync = f"--sync-bucket {s3_bucket} "
     return (
         "bash -lc '"
         "set -uo pipefail; "
@@ -214,12 +239,39 @@ def build_docker_args(cfg: PodRecord, git_ref: str) -> str:
         f"cd {REPO_SUBDIR} && "
         'pip install -q -e ".[gpu]" && '
         'pip install -q "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"; '
+        f"{fetch}"
         f"timeout --signal=TERM {cfg.max_seconds}s python tools/run_experiment.py "
         f"--config {cfg.config_path} --run-id {cfg.run_id} --resume "
+        f"{sync}"
         f"--out {out_dir} > {out_dir}/job.log 2>&1; "
         f"echo $? > {out_dir}/EXIT_CODE"
         "'"
     )
+
+
+# S3 settings the pod needs to reach the bucket. Read from the launcher's own
+# environment and forwarded through create_pod(env=...); nothing is ever read
+# from a config file or written to the state file.
+S3_ENV_VARS = (
+    "S3_ENDPOINT_URL",
+    "S3_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_DEFAULT_REGION",
+)
+
+
+def s3_env(bucket: str | None, environ=None) -> dict[str, str]:
+    """The S3 env vars to hand a pod, or {} when no bucket is configured."""
+    if not bucket:
+        return {}
+    environ = os.environ if environ is None else environ
+    env = {"S3_BUCKET": bucket}
+    for name in S3_ENV_VARS:
+        value = environ.get(name)
+        if value:
+            env[name] = value
+    return env
 
 
 def launch(
@@ -237,6 +289,7 @@ def launch(
     rates_path: Path = DEFAULT_RATES_FILE,
     client=None,
     dry_run: bool = False,
+    s3_bucket: str | None = None,
 ) -> list[PodRecord]:
     if client is None:
         import runpod as client
@@ -280,7 +333,7 @@ def launch(
             append_state(rec, state_path)  # QUEUED: no pod_id yet
             created.append(rec)
             continue
-        docker_args = build_docker_args(rec, git_ref)
+        docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
         pod = client.create_pod(
             name=name,
             image_name=image,
@@ -290,7 +343,11 @@ def launch(
             container_disk_in_gb=20,
             docker_args=docker_args,
             ports="22/tcp",
-            env={"RUN_ID": rec.run_id, "MAX_SECONDS": str(max_seconds)},
+            env={
+                "RUN_ID": rec.run_id,
+                "MAX_SECONDS": str(max_seconds),
+                **s3_env(s3_bucket),
+            },
         )
         rec.pod_id = pod["id"] if isinstance(pod, dict) else pod
         append_state(rec, state_path)  # cost-safety rule: append BEFORE moving on
@@ -348,6 +405,7 @@ def relaunch(
     image: str = DEFAULT_IMAGE,
     state_path: Path = DEFAULT_STATE_FILE,
     client=None,
+    s3_bucket: str | None = None,
 ) -> list[PodRecord]:
     if client is None:
         import runpod as client
@@ -370,7 +428,7 @@ def relaunch(
             config_path=r["config_path"],
             name=r.get("name", f"bdhx-{r['sweep']}-{r['exp']}"),
         )
-        docker_args = build_docker_args(rec, git_ref)
+        docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
         pod = client.create_pod(
             name=rec.name,
             image_name=image,
@@ -380,7 +438,11 @@ def relaunch(
             container_disk_in_gb=20,
             docker_args=docker_args,
             ports="22/tcp",
-            env={"RUN_ID": rec.run_id, "MAX_SECONDS": str(rec.max_seconds)},
+            env={
+                "RUN_ID": rec.run_id,
+                "MAX_SECONDS": str(rec.max_seconds),
+                **s3_env(s3_bucket),
+            },
         )
         rec.pod_id = pod["id"] if isinstance(pod, dict) else pod
         append_state(rec, state_path)
@@ -514,6 +576,12 @@ def main(argv: list[str] | None = None) -> int:
     p_launch.add_argument("--max-wall-clock-minutes", type=int, default=180)
     p_launch.add_argument("--image", default=DEFAULT_IMAGE)
     p_launch.add_argument("--dry-run", action="store_true")
+    p_launch.add_argument(
+        "--s3-bucket",
+        default=None,
+        help="opt in to off-pod checkpoint sync (RUNPOD.md section 3); "
+        "default is local disk plus `collect` over scp",
+    )
 
     sub.add_parser("status")
 
@@ -521,6 +589,7 @@ def main(argv: list[str] | None = None) -> int:
     p_relaunch.add_argument("generated_dir")
     p_relaunch.add_argument("--git-ref", required=True)
     p_relaunch.add_argument("--max-concurrent", type=int, default=6)
+    p_relaunch.add_argument("--s3-bucket", default=None)
 
     sub.add_parser("watchdog")
 
@@ -558,13 +627,19 @@ def _dispatch(args: argparse.Namespace) -> int:
             max_wall_clock_minutes=args.max_wall_clock_minutes,
             image=args.image,
             dry_run=args.dry_run,
+            s3_bucket=args.s3_bucket,
         )
         launched = sum(1 for r in created if r.pod_id)
         print(f"{launched} pods created, {len(created) - launched} queued")
     elif args.cmd == "status":
         print_status(status())
     elif args.cmd == "relaunch":
-        r = relaunch(args.generated_dir, args.git_ref, max_concurrent=args.max_concurrent)
+        r = relaunch(
+            args.generated_dir,
+            args.git_ref,
+            max_concurrent=args.max_concurrent,
+            s3_bucket=args.s3_bucket,
+        )
         print(f"relaunched {len(r)} jobs")
     elif args.cmd == "watchdog":
         t = watchdog()

@@ -88,15 +88,36 @@ Rules while implementing:
 
 ## Stage 0: cloud (GPU)
 
-Tasks 21-23 are unticked and unstarted: no `RUNPOD_API_KEY` was available
-in the session that closed out Stage 0, and no GPU is reachable from it, so
-neither the image build, the pod smoke run, nor the `fla`/Triton GPU checks
-could be executed or verified. They stay open for the first session that
-has cloud credentials.
+No `RUNPOD_API_KEY`, no GPU and no S3 bucket has been reachable from any
+session so far, so the parts of tasks 21-23 that need real cloud resources
+stay open for the first session that has credentials.
 
-- [ ] 21. `docker/Dockerfile`, `docker/entrypoint.sh`, `tools/sync_checkpoint.py`,
-      `tools/fetch_latest_checkpoint.py`. Accept: image builds; entrypoint
-      runs a tiny config in `docker run` locally with `--device cpu`.
+- [x] 21. `docker/Dockerfile`, `docker/entrypoint.sh`, `tools/sync_checkpoint.py`,
+      `tools/fetch_latest_checkpoint.py`, plus `bdhx/s3sync.py` (the shared
+      key layout and commit ordering) and a real `uv.lock`.
+
+      Verified: `uv.lock` generated and committed; the entrypoint runs
+      `configs/base/tiny_smoke.yaml` end to end with `--device cpu`, writes
+      `/workspace/runs/smoke`, and resumes correctly on a second invocation;
+      with an unreachable bucket it aborts instead of silently cold starting;
+      the Dockerfile's dependency lines (`uv export`, the CUDA-stack filter,
+      `uv pip install --no-deps`) were run verbatim in a real container build
+      and install the framework, boto3 and the RunPod SDK while leaving
+      torch/triton/nvidia-* to the base image; the base image tag was checked
+      against Docker Hub (the tag the spec used to quote does not exist, see
+      RUNPOD.md section 2); `ruff` clean and 388 tests pass.
+
+      NOT verified: the image itself has never been built. The
+      `runpod/pytorch` base is about 22 GB extracted and did not fit the free
+      disk of the implementing environment, so the acceptance clause "image
+      builds" is still open, as is `docker run` proper (the entrypoint was
+      exercised directly instead). No S3-compatible bucket has ever been
+      contacted: `bdhx/s3sync.py` is unit-tested against a fake client only,
+      and its endpoint, addressing and checksum settings come from vendor
+      docs, not a live round trip. Both gaps are recorded in RUNPOD.md
+      section 10. The first session with a GPU pod and a bucket should build
+      the image and do one manual sync/fetch round trip before trusting a
+      sweep to either.
 - [ ] 22. `tools/runpod_launch.py` (`estimate`, `launch`, `status`, `relaunch`,
       `watchdog`, `reap`, `collect`) and `configs/runpod_rates.yaml`.
       Accept: `estimate` and `reap` unit-tested against a fake SDK;
