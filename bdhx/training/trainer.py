@@ -167,6 +167,7 @@ class Trainer:
         resume: bool = False,
         config_hash: str | None = None,
         worker: int = 0,
+        on_checkpoint: Callable[[Path, int, str], None] | None = None,
     ):
         self.cfg = cfg
         self.model = model
@@ -176,6 +177,7 @@ class Trainer:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.device = device or resolve_device(cfg)
         self.eval_fn = eval_fn
+        self.on_checkpoint = on_checkpoint
         self.log = log or (lambda msg: None)
         self.worker = int(worker)
         self.config_hash = config_hash or compute_config_hash(cfg)
@@ -269,7 +271,27 @@ class Trainer:
         self._last_ckpt_step = self.state.step
         self._prune_checkpoints()
         self.log(f"checkpoint step={self.state.step} reason={reason} path={path}")
+        self._notify_checkpoint(path, reason)
         return path
+
+    def _notify_checkpoint(self, path: Path, reason: str) -> None:
+        """Run the optional off-box sync hook (RUNPOD.md section 3).
+
+        The hook fires on exactly the schedule the protocol asks for, because
+        every trigger in this class -- `checkpoint_every_steps`, the 5 minute
+        `CHECKPOINT_MAX_INTERVAL_S` guard, sigterm, wall clock, divergence and
+        the final step -- goes through `save_checkpoint`.
+
+        A sync failure is logged and swallowed: the local checkpoint is
+        already written, so losing an upload costs at most the work since the
+        last successful one, whereas killing the run costs all of it.
+        """
+        if self.on_checkpoint is None:
+            return
+        try:
+            self.on_checkpoint(path, self.state.step, reason)
+        except Exception as e:  # noqa: BLE001 - never let a sync error end a run
+            self.log(f"checkpoint sync failed at step {self.state.step}: {e}")
 
     def _prune_checkpoints(self) -> None:
         files = sorted(self.ckpt_dir.glob("step_*.pt"))

@@ -68,7 +68,11 @@ def test_run_experiment_smoke(model, tmp_path):
     out_dir = tmp_path / "results"
     stdout, metadata = run_experiment(model, out_dir, tmp_path / "data")
     run_dir = out_dir / model
-    assert "stub, nothing uploaded" in stdout
+    # --sync-bucket now really wires up bdhx/s3sync.py (HANDOFF task 21); it
+    # used to log a stub. The bucket here is unreachable on purpose, so this
+    # also pins the guarantee that a dead bucket costs uploads, not the run:
+    # every assertion below still holds.
+    assert "checkpoint sync enabled" in stdout
     assert metadata["steps_completed"] == STEPS
     assert metadata["param_total"] > 0 and metadata["config_hash"]
     assert metadata["examples_seen"] == STEPS * 8

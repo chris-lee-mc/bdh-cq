@@ -85,6 +85,22 @@ def check_param_budget(cfg, report, log) -> None:
         )
 
 
+def build_checkpoint_sync(bucket: str | None, run_id: str, config_hash: str, log):
+    """A `CheckpointSync` when a bucket is configured, else None.
+
+    S3 is optional throughout (RUNPOD.md sections 3 and 4): with no bucket the
+    run writes only to local disk and is collected over scp by
+    `tools/runpod_launch.py collect`.
+    """
+    from bdhx.s3sync import CheckpointSync, S3Settings, make_client
+
+    settings = S3Settings.from_env(bucket)
+    if settings is None:
+        return None
+    log(f"checkpoint sync enabled: s3://{settings.bucket}/runs/{run_id}")
+    return CheckpointSync(make_client(settings), settings.bucket, run_id, config_hash, log=log)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -92,7 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--out", default="results")
     parser.add_argument("--overrides", nargs="*", default=None, metavar="KEY=VALUE")
-    parser.add_argument("--sync-bucket", default=None, help="optional; logged, no upload here")
+    parser.add_argument(
+        "--sync-bucket",
+        default=None,
+        help="S3-compatible bucket for checkpoint/result sync; defaults to $S3_BUCKET",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config, parse_overrides(args.overrides))
@@ -162,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         eval_seconds += time.perf_counter() - t0
 
+    sync = build_checkpoint_sync(args.sync_bucket, run_id, chash, log)
     trainer = Trainer(
         cfg,
         model,
@@ -172,6 +193,9 @@ def main(argv: list[str] | None = None) -> int:
         log=log,
         resume=args.resume,
         config_hash=chash,
+        on_checkpoint=(lambda path, step, _reason: sync.upload_checkpoint(path, step))
+        if sync
+        else None,
     )
     state = trainer.train()
     log(f"training finished status={state.status} steps={state.step}")
@@ -197,10 +221,11 @@ def main(argv: list[str] | None = None) -> int:
         resumed_from=state.resumed_from,
         preemptions=state.preemptions,
     )
-    if args.sync_bucket:
-        log(
-            f"--sync-bucket {args.sync_bucket}: stub, nothing uploaded (see tools/sync_checkpoint.py)"
-        )
+    if sync:
+        try:
+            sync.upload_results(run_dir)
+        except Exception as e:  # noqa: BLE001 - the run itself already succeeded
+            log(f"final result upload failed: {e}")
     log(f"done: {run_dir}")
     log.close()
     return 0
