@@ -25,6 +25,11 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["flash-linear-attention==0.5.2"]
 runpod = ["runpod>=1.12"]
+# S3-compatible checkpoint sync (RUNPOD.md section 3). Declared separately
+# from `runpod` even though the RunPod SDK happens to pull boto3 in today:
+# the sync tools target any S3-compatible store (R2, B2, RunPod network
+# volumes), so the dependency belongs to the feature that uses it.
+s3 = ["boto3>=1.34"]
 dev = ["pytest", "ruff==0.16.5"]
 
 [tool.hatch.build.targets.wheel]

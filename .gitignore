@@ -12,3 +12,7 @@ __pycache__/
 # Phase 0 evidence referenced by docs/PHASE0_REPRODUCTION.md; the monorepo
 # root .gitignore excludes *.log.
 !docs/phase0_logs/*.log
+
+# The dependency pin for docker/Dockerfile (RUNPOD.md section 2), which COPYs
+# it; the monorepo root .gitignore excludes uv.lock as an upstream C++ rule.
+!uv.lock
