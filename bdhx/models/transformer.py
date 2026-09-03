@@ -208,7 +208,13 @@ class SeqReasoner(ReasoningModel):
         seq = torch.cat(parts, dim=1)
         start = prefix.shape[1] + 1 + q.shape[1]  # index of the ANSWER token
         h, diag = self._run(seq, reasoning_steps, collect_diagnostics)
-        logits = self.logits_from_hidden(h[:, start : start + tl])
+        idx = start + torch.arange(tl, device=h.device)
+        if tl > 0:
+            idx = idx.clone()
+            idx[0] -= 1  # first answer token reads from the last query token, not
+            # the constant ANSWER marker; see TASK_SUITE_SPEC.md section 1
+        idx = idx.clamp(0, h.shape[1] - 1)
+        logits = self.logits_from_hidden(h[:, idx])
         return SolveOutput(
             predictions=logits.argmax(dim=-1),
             logits=logits,
@@ -220,6 +226,9 @@ class SeqReasoner(ReasoningModel):
         h, _ = self._run(batch.serialized, reasoning_steps, False)
         lt = batch.target.shape[1]
         idx = batch.answer_start.unsqueeze(1) - 1 + torch.arange(lt, device=h.device)
+        if lt > 0:
+            idx[:, 0] -= 1  # first answer token reads from the last query token, not
+            # the constant ANSWER marker; see TASK_SUITE_SPEC.md section 1
         idx = idx.clamp(0, h.shape[1] - 1)
         gathered = h.gather(1, idx.unsqueeze(-1).expand(-1, -1, h.shape[-1]))
         return self.logits_from_hidden(gathered)
