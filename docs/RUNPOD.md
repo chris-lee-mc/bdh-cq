@@ -5,12 +5,16 @@ itself is cloud-independent; this document describes the launcher and the
 operational rules for running sweeps on RunPod.
 
 Sourcing caveat: runpod.io and docs.runpod.io were not reachable from the
-research environment. SDK signatures below come from the public
-`runpod/runpod-python` repository and are considered reliable. Prices,
-preemption notice windows, network-volume rates, and region lists were
-triangulated from several 2026 third-party sources and MUST be re-checked
-against runpod.io/pricing and docs.runpod.io before the first paid sweep.
-Items known to be unverified are listed in section 10.
+research environment that wrote v0.1 of this document. SDK signatures below
+come from the public `runpod/runpod-python` repository and are considered
+reliable. Prices, preemption notice windows, network-volume rates, and
+region lists were triangulated from several 2026 third-party sources at
+that time.
+
+Re-checked 2026-09-03 (this session, runpod.io/docs.runpod.io reachable,
+plus the live `runpod` SDK against the account's `RUNPOD_API_KEY`): GPU
+prices for RTX A5000 and RTX 4090 and the network-volume rate below are now
+verified, not triangulated. See section 10 for what is still open.
 
 ## 1. Which hardware
 
@@ -20,13 +24,18 @@ tolerance, not VRAM.
 
 | GPU               | Community (spot-like) | Secure (on-demand) | Use                          |
 |-------------------|-----------------------|--------------------|------------------------------|
-| RTX A5000 24GB    | ~$0.16/hr             | ~$0.27/hr          | default for Stage A-D sweeps |
-| RTX 4090 24GB     | ~$0.34/hr             | ~$0.69-0.74/hr     | faster small jobs            |
+| RTX A5000 24GB    | $0.16/hr (verified)   | $0.27/hr (verified)| default for Stage A-D sweeps |
+| RTX 4090 24GB     | $0.34/hr (verified)   | $0.74/hr (verified)| faster small jobs            |
 | L4 24GB           | n/a                   | ~$0.39/hr          | alternative                  |
 | A40 48GB          | n/a                   | ~$0.44/hr          | 50M-150M models              |
 | L40S 48GB         | n/a                   | ~$0.99/hr          | 50M-150M models              |
 | A100 80GB PCIe    | ~$1.19/hr             | ~$1.39/hr          | not needed before 100M+      |
 | H100 80GB SXM     | ~$2.69/hr             | ~$2.99/hr          | not needed                   |
+
+A5000 and 4090 rates verified 2026-09-03 two ways: `runpod.get_gpu(gpu_id)`
+via the live SDK (`communityPrice`/`securePrice`/`lowestPrice`) and
+https://www.runpod.io/pricing, independently, exact agreement. The other
+rows are still the original third-party-triangulated estimates.
 
 Rules:
 
@@ -108,10 +117,15 @@ Protocol (implemented in `bdhx/training/trainer.py` and
 - Results (`results.json`, `train_log.csv`, `metadata.json`, logs) are
   uploaded at the end and after each evaluation.
 
-Network volumes: about $0.07/GB-month (unverified). They are region
-pinned; if used, create the volume in a region that also supports the
-S3-compatible API (reported: EUR-IS-1, EU-RO-1, EU-CZ-1, US-KS-2, US-CA-2;
-verify).
+Network volumes, verified 2026-09-03 against docs.runpod.io/pods/pricing and
+www.runpod.io/pricing (agreed exactly): $0.07/GB-month standard tier under
+1TB, $0.05/GB-month standard over 1TB, $0.14/GB-month high-performance tier.
+They are region pinned; if used, create the volume in a region that also
+supports the S3-compatible API. Verified 2026-09-03 against
+docs.runpod.io/storage/s3-api, full list: EU-CZ-1, EU-RO-1, EUR-IS-1,
+EUR-NO-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-MD-1, US-MO-1, US-MO-2,
+US-NC-1, US-NC-2, US-NE-1, US-WA-1 (endpoint pattern
+`https://s3api-<DATACENTER>.runpod.io/`).
 
 ## 4. Entrypoint (`docker/entrypoint.sh`)
 
@@ -268,14 +282,35 @@ Community Cloud. The scale-up phases (S1 at 2M-25M, then 50M, then
 
 ## 10. Unverified items (re-check before first paid sweep)
 
-- All prices and the network-volume $/GB-month rate.
-- Community Cloud interruption notice window.
-- REST API base URL; the GraphQL endpoint is the reliable path.
-- `runpodctl pod create` flag for a startup command (use the SDK's
-  `docker_args` or a template instead).
-- Whether the SDK auto-reads `RUNPOD_API_KEY` (set `runpod.api_key`
-  explicitly regardless).
-- Triton and flash-linear-attention inside `runpod/pytorch` images
-  (smoke-test the built image).
-- `create_template` signature.
-- S3-API region list for network volumes.
+Re-checked 2026-09-03 (this session; no RunPod MCP server was connected in
+this session despite the task briefing expecting one, so this used the
+`runpod` Python SDK plus direct fetches of runpod.io/docs.runpod.io):
+
+- ~~All prices and the network-volume $/GB-month rate.~~ VERIFIED: A5000 and
+  4090 Community/Secure rates (section 1) and network-volume rate
+  (section 3), both two ways (live SDK `get_gpu()` and the public pricing
+  page, or the public pricing page and docs page), exact agreement each
+  time. L4/A40/L40S/A100/H100 rows remain the original estimate.
+- Community Cloud interruption notice window: STILL UNVERIFIED. Neither
+  runpod.io/pricing, docs.runpod.io/pods/pricing, nor
+  docs.runpod.io/pods/manage-pods states a notice period, guaranteed or
+  otherwise, for Community Cloud preemption. Treat this as confirmation of
+  the conservative assumption already in section 1 (near-zero notice,
+  checkpointing is the safety net), not as a new number.
+- REST API base URL: not re-checked; the GraphQL endpoint
+  (`https://api.runpod.io/graphql`, used throughout this document) remains
+  the reliable path and is what the launcher uses.
+- `runpodctl pod create` flag for a startup command: not needed for the
+  simplest-pod approach (SDK `create_pod` with a stock image and an `env`
+  dict); not re-checked.
+- Whether the SDK auto-reads `RUNPOD_API_KEY`: not re-checked; continue to
+  set `runpod.api_key` explicitly, which works regardless.
+- Triton and flash-linear-attention inside `runpod/pytorch` images: not yet
+  checked from this session (needs an actual GPU pod); still the first thing
+  to test on the first provisioned pod.
+- `create_template` signature: not re-checked; not needed for the
+  simplest-pod approach, which calls `create_pod` directly without a
+  template.
+- ~~S3-API region list for network volumes.~~ VERIFIED 2026-09-03 against
+  docs.runpod.io/storage/s3-api: see section 3 for the full list (larger
+  than the originally reported five regions).

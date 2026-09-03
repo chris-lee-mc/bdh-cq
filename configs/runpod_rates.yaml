@@ -1,12 +1,21 @@
 # Hand-maintained $/hour table used by tools/runpod_launch.py estimate.
-# Values observed from third-party sources 2026-09; re-check runpod.io/pricing
-# before each sweep and record the date.
-as_of: 2026-09-02
+# A5000 and 4090 rates verified 2026-09-03 directly against the runpod
+# Python SDK's get_gpu() (live GraphQL) and https://www.runpod.io/pricing;
+# both sources agreed exactly. The rest are carried over from the original
+# third-party-sourced estimate and are not yet independently re-checked.
+as_of: 2026-09-03
 rates:
-  "NVIDIA RTX A5000": {COMMUNITY: 0.16, SECURE: 0.27}
-  "NVIDIA GeForce RTX 4090": {COMMUNITY: 0.34, SECURE: 0.74}
+  "NVIDIA RTX A5000": {COMMUNITY: 0.16, SECURE: 0.27}       # verified 2026-09-03
+  "NVIDIA GeForce RTX 4090": {COMMUNITY: 0.34, SECURE: 0.74} # verified 2026-09-03
   "NVIDIA L4": {SECURE: 0.39}
   "NVIDIA A40": {SECURE: 0.44}
   "NVIDIA L40S": {SECURE: 0.99}
   "NVIDIA A100 80GB PCIe": {COMMUNITY: 1.19, SECURE: 1.39}
 contingency_multiplier: 1.3
+# Network volume storage, verified 2026-09-03 against docs.runpod.io/pods/pricing
+# and www.runpod.io/pricing (both agreed): standard tier $0.07/GB-month under
+# 1TB, $0.05/GB-month over 1TB; high-performance tier $0.14/GB-month.
+network_volume_per_gb_month:
+  standard_under_1tb: 0.07
+  standard_over_1tb: 0.05
+  high_performance: 0.14
