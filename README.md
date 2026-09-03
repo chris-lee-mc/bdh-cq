@@ -31,6 +31,11 @@ Read in this order:
 8. `docs/RESULTS.md`: results ledger (empty until Stage A).
 9. `configs/`: sweep definitions for Stages A-D.
 
+Before launching any sweep, run `python tools/sanity_learnability.py`; it
+must exit 0 (`docs/HANDOFF_TASKS.md` task 23b). It trains two baselines on
+the `binding` task for 3000 CPU steps and fails when the pipeline runs but
+learns nothing, which is exactly what the first Stage A dev sweep did.
+
 Ground rules: one variable per experiment, matched parameters and FLOPs,
 at least three seeds, negative results kept, every number traceable to a
 config hash, commit, and seed. The community implementation is never

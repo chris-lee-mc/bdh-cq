@@ -7,8 +7,9 @@ sweep:
   name: a1_cpu_mini
   stage: A
   description: >
-    CPU-scale replica of A1: bdh vs bdh_cq vs looped_transformer at 205k params
-    on compose, R_train {1,2,4}, R_test {1,2,4,8,16}, 3 seeds, device cpu.
+    CPU-scale replica of A1: bdh vs bdh_cq vs looped_transformer at 350k params
+    and depth 2 on compose, R_train {1,2,4}, R_test {1,2,4,8,16}, 3 seeds,
+    device cpu.
 base: configs/base/default.yaml
 dev: true
 grid:
@@ -16,7 +17,8 @@ grid:
 seeds: [1, 2, 3]
 overrides:
   experiment.tags: [dev, cpu_mini]
-  model.params_target: 205_000
+  model.params_target: 350_000
+  model.depth: 2
   model.recurrence.kind: plain
   model.recurrence.share_weights: true
   model.recurrence.input_injection: true
@@ -28,7 +30,7 @@ overrides:
     mild: [{depth: 3}, {depth: 4}]
     strong: [{depth: 6}, {depth: 8}]
   task.n_eval_episodes: 100
-  training.steps: 6000
+  training.steps: 3000
   training.batch_size: 16
   training.precision: bf16          # no-op on cpu, kept to match a1_first_experiment
   training.warmup_steps: 300
@@ -40,13 +42,21 @@ overrides:
   evaluation.diagnostics: true
   compute.device: cpu
   compute.deterministic: true
-  compute.max_wall_clock_minutes: 10
+  compute.max_wall_clock_minutes: 25
 notes: >
-  params_target is 205_000, not the 150_000 a smaller budget would suggest:
-  with vocab 4128 the BDH width solver's smallest admissible width (16) already
-  costs 135k params and the next width (24) costs 205k, so 150_000 is outside
-  the 5 percent hard bound for bdh/bdh_cq. 205_000 is the smallest target all
-  three models hit within 0.2 percent (bdh/bdh_cq width 24, looped width 44).
+  params_target is 350_000: with vocab 4128 the BDH width solver only accepts a
+  coarse grid, and 350_000 is the smallest target above 205_000 that all three
+  models hit within 0.2 percent (bdh/bdh_cq width 40, looped width 62). Values
+  between 205_000 and 350_000 (300k, 400k, 450k) are outside the solver's
+  5 percent hard bound for bdh/bdh_cq and fail fast.
+  model.depth is pinned to 2 rather than inherited so the run stays comparable
+  if the base default changes again: 2 distinct BDH block applications per pass
+  for bdh/bdh_cq, 2 layers inside the shared block for looped_transformer
+  (FRAMEWORK_SPEC section 2). The first version of this sweep ran at depth 1
+  and an N(0, 1) tied unembedding and was flat at ln(4128) in every cell; see
+  RESULTS.md section A0.
+  steps is 3000, halved from 6000, because depth 2 at 350k params costs about
+  five times more per step; the 9 jobs still fit in about 45 CPU-minutes.
   Dev run. Tagged [dev, cpu_mini] so aggregate_results flags every row DEV and
   excludes it from README-grade tables. eval_every_steps is set above the step
   budget so each job pays for exactly one final evaluation.

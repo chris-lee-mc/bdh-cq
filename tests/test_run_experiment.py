@@ -24,6 +24,7 @@ MODELS = ["bdh", "bdh_cq", "looped_transformer", "transformer", "gated_deltanet"
 RECURRENT = {"bdh_cq", "looped_transformer"}
 REASONING_STEPS = [1, 2, 4]
 STEPS = 10
+DEPTH = 2  # configs/base/default.yaml model.depth
 
 
 def run_experiment(model: str, out_dir, data_root) -> tuple[str, dict]:
@@ -90,9 +91,10 @@ def test_run_experiment_smoke(model, tmp_path):
         assert row.adaptation is None
         diagnostics = row.diagnostics
         assert diagnostics is not None
-        # length R for the recurrent models; fixed-depth baselines run their
+        # length R for the recurrent models (one entry per reasoning step, even
+        # though a step applies `depth` layers); fixed-depth baselines run their
         # stack once per episode, so their series is one entry per block.
-        expected = row.reasoning_steps if model in RECURRENT else 1
+        expected = row.reasoning_steps if model in RECURRENT else DEPTH
         for key in ("state_norm", "update_norm", "cos_consecutive", "active_neuron_frac"):
             assert len(getattr(diagnostics, key)) == expected, key
         assert len(diagnostics.activation_percentiles) == expected

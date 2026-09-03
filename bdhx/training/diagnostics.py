@@ -19,7 +19,10 @@ Deviations, documented:
   have no separate activation module (Transformer, gated DeltaNet).
 - Models with no recurrence runner (fixed-depth baselines) have no per-step
   series of their own beyond the last block, so their series length is the
-  number of block applications, not `reasoning_steps`.
+  number of block applications (`model.depth`), not `reasoning_steps`.
+- A recurrent model whose step applies `model.depth` layers fires the
+  activation tap `depth` times per step; the last layer of each step is kept so
+  that every series has one entry per reasoning step.
 """
 
 from __future__ import annotations
@@ -215,6 +218,12 @@ def collect(
     if runner is None:
         records = records[: max(int(getattr(out, "block_applications", 0)), 1)]
     length = len(diag.get("state_norm", []) or [])
+    if runner is not None and length and len(records) > length and not len(records) % length:
+        # `model.depth` layers per reasoning step fire the activation tap once
+        # per layer; keep the last layer of each step so the series stay aligned
+        # with the one state the runner records per step.
+        per_step = len(records) // length
+        records = records[per_step - 1 :: per_step]
     if length != len(records):
         # fixed-depth baselines only record the last block; rebuild from the tap.
         length = len(records)

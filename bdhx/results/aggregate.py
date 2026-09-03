@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ from bdhx.results.schema import ResultsFile, ResultsWriter
 NOT_MATCHED_PARAMS_TOL = 0.05
 NOT_MATCHED_FLOPS_TOL = 0.15
 HIGH_VAR_CV = 0.3
+# A run whose final train loss is still within this fraction of ln(vocab_size)
+# never left the uniform-prediction plateau: it learned nothing (AT_CHANCE).
+AT_CHANCE_TOL = 0.03
 README_GRADE_SEEDS = 5
 BOOTSTRAP_RESAMPLES = 1000
 
@@ -55,6 +59,46 @@ class RunRecord:
     @property
     def train_flops_estimate(self) -> float | None:
         return (self.metadata or {}).get("train_flops_estimate")
+
+    @property
+    def final_train_loss(self) -> float | None:
+        """Last finite `loss` in `train_log.csv`, or None when there is no curve."""
+        path = self.run_dir / "train_log.csv"
+        if not path.exists():
+            return None
+        last = None
+        try:
+            with path.open(newline="") as fh:
+                for row in csv.DictReader(fh):
+                    try:
+                        value = float(row.get("loss", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value):
+                        last = value
+        except OSError:
+            return None
+        return last
+
+
+def chance_loss(task_name: str) -> float:
+    """Cross-entropy of the uniform distribution over the task vocabulary."""
+    from bdhx.registry import get_task
+    from bdhx.tasks.vocab import VOCAB_SIZE
+
+    try:
+        vocab = int(get_task(task_name)().vocab_size)
+    except Exception:  # noqa: BLE001 - unknown task name: fall back to the shared vocab
+        vocab = VOCAB_SIZE
+    return math.log(max(vocab, 2))
+
+
+def at_chance(final_loss: float | None, task_name: str, tol: float = AT_CHANCE_TOL) -> bool:
+    """True when `final_loss` is still within `tol` of ln(vocab_size)."""
+    if final_loss is None or not math.isfinite(final_loss):
+        return False
+    reference = chance_loss(task_name)
+    return abs(final_loss - reference) <= tol * reference
 
 
 def walk_runs(results_root: str | Path) -> list[RunRecord]:
@@ -323,6 +367,21 @@ def build_flags(records: list[RunRecord], summary: list[dict[str, Any]]) -> list
                 )
 
     for rec in records:
+        loss = rec.final_train_loss
+        if at_chance(loss, rec.results.task):
+            flags.append(
+                {
+                    "flag": "AT_CHANCE",
+                    "config_hash": rec.results.config_hash,
+                    "model": rec.results.model,
+                    "task": rec.results.task,
+                    "detail": (
+                        f"final train loss {loss:.3f} is within "
+                        f"{AT_CHANCE_TOL:.0%} of ln(vocab)="
+                        f"{chance_loss(rec.results.task):.3f}: the run learned nothing"
+                    ),
+                }
+            )
         if rec.results.status == "incomplete":
             flags.append(
                 {

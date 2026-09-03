@@ -17,6 +17,8 @@ from bdhx.registry import register_model
 from bdhx.tasks.base import EpisodeBatch
 from bdhx.tasks.vocab import ANSWER, BOS, PAD, QUERY
 
+EMBED_INIT_STD = 0.02
+
 
 def pick_heads(width: int) -> int:
     """Largest head count in {8,4,2,1} giving an even head dim (RoPE needs pairs)."""
@@ -101,13 +103,45 @@ class TransformerBlock(nn.Module):
         return x + (self.post2(h) if self.sandwich_norm else h)
 
 
+class SharedStack(nn.Module):
+    """`depth` pre-norm blocks applied in order: the unit a looped model repeats.
+
+    FRAMEWORK_SPEC section 2: for a looped model `model.depth` counts the layers
+    *inside* the shared block, not the number of distinct blocks. One layer per
+    step cannot express induction-style copying (that needs two attention
+    layers), which is why the looped default is 2.
+    """
+
+    def __init__(
+        self, width: int, depth: int, heads: int | None = None, sandwich_norm: bool = False
+    ):
+        super().__init__()
+        self.depth = max(int(depth), 1)
+        self.layers = nn.ModuleList(
+            [TransformerBlock(width, heads, sandwich_norm) for _ in range(self.depth)]
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class SeqReasoner(ReasoningModel):
     """Sequence-native ReasoningModel: consumes the serialized episode.
 
     Subclasses implement `_run(tokens, reasoning_steps, collect_diagnostics)`
     returning `(hidden (B, L, D), diagnostics)` and `_applications(R)`.
     The unembedding is tied to the token embedding (no separate parameter, so
-    `param_report().total` equals the state_dict numel sum).
+    `param_report().total` equals the state_dict numel sum). Because the head is
+    tied, the embedding init sets the logit scale: `nn.Embedding`'s default
+    N(0, 1) makes the init logits O(sqrt(width)) and the init cross-entropy tens
+    of nats instead of ln(vocab). The embedding is therefore initialized at
+    `EMBED_INIT_STD`, the usual transformer value, and `embed_tokens` passes it
+    through a parameter-free RMSNorm (the community BDH's `post_embed_norm`,
+    `bdh_cq.py:288`) so that the residual stream starts at unit RMS whatever the
+    init std. Without it a 0.02 embedding makes content-based key matching start
+    from attention logits of order 1e-3 and the match circuit never forms.
     """
 
     requires_serialized = True
@@ -118,6 +152,8 @@ class SeqReasoner(ReasoningModel):
         self.width = int(width)
         self.target_length = int(target_length)
         self.embed = nn.Embedding(vocab_size, width)
+        nn.init.normal_(self.embed.weight, mean=0.0, std=EMBED_INIT_STD)
+        self.embed_norm = nn.RMSNorm(width, elementwise_affine=False)
         self.norm_out = nn.RMSNorm(width)
         self._prefix: Tensor | None = None
 
@@ -137,6 +173,10 @@ class SeqReasoner(ReasoningModel):
             toks.append(MAP)
             toks.extend(int(t) for t in out.flatten().tolist())
         self._prefix = torch.tensor(toks, dtype=torch.long).unsqueeze(0)
+
+    def embed_tokens(self, tokens: Tensor) -> Tensor:
+        """Token embedding at unit RMS; the input of every `_run`."""
+        return self.embed_norm(self.embed(tokens.to(self.embed.weight.device)))
 
     # -- readout -----------------------------------------------------------
     def logits_from_hidden(self, h: Tensor) -> Tensor:
@@ -250,7 +290,7 @@ class TransformerModel(SeqReasoner):
     def _run(
         self, tokens: Tensor, reasoning_steps: int, collect_diagnostics: bool
     ) -> tuple[Tensor, dict[str, list]]:
-        h = self.embed(tokens.to(self.embed.weight.device))
+        h = self.embed_tokens(tokens)
         diag = {k: [] for k in ("state_norm", "update_norm", "cos_consecutive", "nan_count")}
         for blk in self.blocks:
             prev = h

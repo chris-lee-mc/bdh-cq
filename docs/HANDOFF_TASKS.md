@@ -103,6 +103,16 @@ has cloud credentials.
       one real single-pod smoke run of a tiny config, then `reap`.
 - [ ] 23. GPU checks: Triton and `fla` import and a Gated DeltaNet forward in
       the image; `profile_config.py` on each Stage A model at 10M.
+- [x] 23b. MANDATORY BEFORE EVERY SWEEP: `python tools/sanity_learnability.py`
+      must exit 0. It trains `transformer` (depth 2) and `looped_transformer`
+      (depth 2 inside the shared block, R_train {1, 2}) on `binding` for 3000
+      CPU steps at 1.5M parameters and requires exact match >= 0.9 on the
+      `interp` n_bindings=1 cell at every evaluated R, with a final training
+      loss below the `AT_CHANCE` plateau (within 3 percent of ln(vocab_size)).
+      `--quick` shrinks it to about 30 seconds for CI at a 0.5 gate.
+      Do not launch a sweep, and do not report any table, while this fails:
+      the whole of `RESULTS.md` section A0 was produced by a pipeline that ran
+      cleanly and learned nothing. Accept: exit 0 and both rows PASS.
 
 ## Stage A
 
@@ -117,9 +127,15 @@ has cloud credentials.
       `configs/stage_a/a1_cpu_mini.yaml`, a 9-job CPU dev replica that
       validates the pipeline only (see `RESULTS.md` section A0). The A1
       results table and the stability classification are still pending.
+      Re-run on 2026-09-03 after the init and effective-depth fixes; the 9
+      runs are still `AT_CHANCE` on compose at 350k parameters, which is now
+      flagged rather than silently reported as accuracy 0.000.
 - [ ] 26. Launch `a2_curriculum`. Update `RESULTS.md`. Write the Gate A finding.
 - [ ] 27. If Gate A passes: `a3_rtrain_sweep`. If not: diagnosis per plan
-      section 10 before anything else.
+      section 10 before anything else. Part of that diagnosis is already done
+      and written up in `RESULTS.md` section A0 (init, effective depth,
+      AT_CHANCE detection, and the measured cost of the [ANSWER] readout
+      position); redo it only for what section A0 leaves open.
 
 ## Stage B
 

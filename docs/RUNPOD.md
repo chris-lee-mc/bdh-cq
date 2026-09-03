@@ -195,6 +195,7 @@ Keep `run_experiment.py` launcher-agnostic so either path works.
 ## 6. Sweep workflow
 
 ```
+python tools/sanity_learnability.py                                       # MANDATORY gate, must exit 0
 python tools/generate_sweep.py configs/stage_a/a1_first_experiment.yaml   # -> generated/a1_first_experiment/
 python tools/profile_config.py generated/a1_first_experiment/exp_000.yaml --device cuda
 python tools/runpod_launch.py estimate generated/a1_first_experiment
@@ -206,6 +207,13 @@ python tools/runpod_launch.py reap --prefix bdhx-a1_first_experiment
 ```
 
 Each generated config is an independent job. Seeds are separate jobs.
+
+`tools/sanity_learnability.py` is the first line and is not optional
+(`HANDOFF_TASKS.md` task 23b): it runs on the CPU of the launching machine in
+about four minutes and refuses the sweep when the pipeline trains without
+learning. After collecting, check `reports/<date>/flags.csv` for `AT_CHANCE`
+rows before reading any accuracy number; an `AT_CHANCE` run is a failed run
+whatever its exact-match column says.
 
 ## 7. Reproducibility inside the job
 

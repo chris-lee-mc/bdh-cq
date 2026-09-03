@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 
 import pytest
@@ -198,3 +199,72 @@ def test_missing_metadata_excluded_from_plot_data(tmp_path):
     assert result["all_runs"].exists()
     png_names = {p.name for p in out_dir.glob("*.png")}
     assert any(n.startswith("acc_vs_reasoning_steps_") for n in png_names)
+
+
+def _write_train_log(run_dir, losses):
+    from bdhx.results.schema import TRAIN_LOG_COLUMNS
+
+    lines = [",".join(TRAIN_LOG_COLUMNS)]
+    for step, loss in enumerate(losses, start=1):
+        row = {c: 0 for c in TRAIN_LOG_COLUMNS}
+        row.update(step=step, loss=loss, lr=1e-3, grad_norm=1.0, r_train=1)
+        lines.append(",".join(str(row[c]) for c in TRAIN_LOG_COLUMNS))
+    (run_dir / "train_log.csv").write_text("\n".join(lines) + "\n")
+
+
+def test_at_chance_helper_uses_ln_vocab():
+    """`AT_CHANCE` fires within 3 percent of ln(vocab_size) and nowhere else."""
+    import math
+
+    import bdhx.tasks  # noqa: F401  (registers 'binding')
+    from bdhx.results.aggregate import AT_CHANCE_TOL, at_chance, chance_loss
+    from bdhx.tasks.vocab import VOCAB_SIZE
+
+    reference = chance_loss("binding")
+    assert reference == pytest.approx(math.log(VOCAB_SIZE))
+    assert at_chance(reference, "binding")
+    assert at_chance(reference * (1 - AT_CHANCE_TOL / 2), "binding")
+    assert not at_chance(reference * (1 - 2 * AT_CHANCE_TOL), "binding")
+    assert not at_chance(0.5, "binding")
+    assert not at_chance(None, "binding")
+    assert not at_chance(float("nan"), "binding")
+
+
+def test_at_chance_flag_fires_for_a_flat_run(tmp_path):
+    """A run whose train loss never leaves ln(vocab) is flagged AT_CHANCE."""
+    import math
+
+    import bdhx.tasks  # noqa: F401
+    from bdhx.tasks.vocab import VOCAB_SIZE
+
+    root = tmp_path / "results"
+    root.mkdir()
+    chance = math.log(VOCAB_SIZE)
+    flat = _write_run(
+        root,
+        "flat",
+        config_hash="hashFlat",
+        seed=1,
+        model="looped_transformer",
+        task="binding",
+        params=1_000_000,
+        exact_match=0.0,
+    )
+    _write_train_log(flat, [chance + 0.4, chance + 0.1, chance - 0.01])
+    learned = _write_run(
+        root,
+        "learned",
+        config_hash="hashLearned",
+        seed=1,
+        model="transformer",
+        task="binding",
+        params=1_000_000,
+        exact_match=1.0,
+    )
+    _write_train_log(learned, [chance, 2.0, 0.05])
+
+    out = aggregate(root, tmp_path / "reports")
+    rows = list(csv.DictReader(out["flags"].open()))
+    at_chance_rows = [r for r in rows if r["flag"] == "AT_CHANCE"]
+    assert [r["config_hash"] for r in at_chance_rows] == ["hashFlat"]
+    assert "ln(vocab)" in at_chance_rows[0]["detail"]

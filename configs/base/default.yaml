@@ -3,7 +3,9 @@ model:
   name: bdh_cq
   params_target: 10_000_000
   width: null
-  depth: 1
+  depth: 2                      # layers per step: distinct layers (transformer,
+                                # gated_deltanet) or layers inside the shared
+                                # block (looped models), = community BDH depth
   precision_state: bf16
   recurrence: {kind: plain, share_weights: true, input_injection: true, step_embedding: false, adapter_rank: 0}
   memory: {kind: bdh, reset_per_episode: true}

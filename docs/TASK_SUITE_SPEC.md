@@ -64,6 +64,22 @@ Requirements:
   episodes. The eval harness asserts this by re-sampling with the same
   rng seed and comparing.
 
+Known cost of the [ANSWER] marker (measured, `RESULTS.md` section A0): the
+first target token is predicted from the hidden state at the [ANSWER]
+position, whose own token is a constant and carries nothing about the query.
+A sequence model must therefore copy the query forward into that position
+before it can match it against the demonstrations, which adds one hop to
+every retrieval task. On `binding` at 1.5M parameters and 3000 steps this is
+the difference between exact match 0.975 (readout at the query token) and
+0.445 (readout at a constant token) in a standalone reference implementation;
+depth, head count, QKV biases, absolute position embeddings, an untied head,
+an auxiliary next-token loss and 4x the steps do not close it. The marker is
+kept because it is what makes `serialize`/`parse_serialized` lossless and
+multi-token targets unambiguous, and because every model pays the same cost,
+but any table on a retrieval task must be read with it in mind: absolute
+accuracies below a few million parameters are floored by this hop, not by the
+memory mechanism under test.
+
 ## 2. Task catalogue
 
 Each task lists: generator, difficulty knobs, train range, eval ranges,
