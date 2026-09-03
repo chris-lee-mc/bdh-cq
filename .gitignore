@@ -1,8 +1,14 @@
-results/
-generated/
-reports/
-data/
+# Anchored to this directory: unanchored patterns also matched bdhx/results/
+# and docs/results/, which are source and committed evidence.
+/results/
+/generated/
+/reports/
+/data/
 runpod_state.jsonl
 *.pt
 __pycache__/
 .venv/
+
+# Phase 0 evidence referenced by docs/PHASE0_REPRODUCTION.md; the monorepo
+# root .gitignore excludes *.log.
+!docs/phase0_logs/*.log

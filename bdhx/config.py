@@ -208,11 +208,34 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     return Config.model_validate(apply_dotted_overrides(load_raw(path), overrides))
 
 
+# Fields that identify a repeat of an experiment rather than a different one.
+# FRAMEWORK_SPEC section 3: "two runs with the same hash and seed are the same
+# experiment", and section 10 groups summary rows by config hash with seed
+# statistics, so the training seed must not enter the hash.
+HASH_EXCLUDED_FIELDS = (("training", "seed"),)
+
+
 def canonical_yaml(cfg: Config) -> str:
-    """Deterministic YAML dump used for hashing (key order irrelevant)."""
+    """Deterministic YAML dump of the full config (key order irrelevant)."""
     return yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=True, default_flow_style=False)
 
 
+def hashable_yaml(cfg: Config) -> str:
+    """`canonical_yaml` minus the seed axis; this is what `config_hash` digests."""
+    data = cfg.model_dump(mode="json")
+    for *path, leaf in HASH_EXCLUDED_FIELDS:
+        node = data
+        for key in path:
+            node = node.get(key, {})
+        node.pop(leaf, None)
+    return yaml.safe_dump(data, sort_keys=True, default_flow_style=False)
+
+
 def config_hash(cfg: Config) -> str:
-    """First 12 hex chars of sha256(canonical_yaml(cfg))."""
-    return hashlib.sha256(canonical_yaml(cfg).encode()).hexdigest()[:12]
+    """First 12 hex chars of sha256(hashable_yaml(cfg)).
+
+    Seed-invariant on purpose: the three seeds of one sweep arm share a hash
+    and differ only in the `_s<seed>` run-directory suffix, which is what lets
+    `aggregate.py` compute seed statistics per arm.
+    """
+    return hashlib.sha256(hashable_yaml(cfg).encode()).hexdigest()[:12]

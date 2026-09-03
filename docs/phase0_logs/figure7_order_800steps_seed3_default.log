@@ -1,0 +1,20 @@
+cmd: python figure7.py --device cpu --family order --steps 800 --seed 3
+commit: c246f8903a8c36496845662d7c4b7b439bb47b09
+torch 2.14.0+cu130 python 3.11.15
+Model name:                              Intel(R) Xeon(R) Processor @ 2.80GHz
+cores: 4
+start: Wed Sep  2 20:10:36 UTC 2026
+step     0  loss 5.0565
+step   200  loss 3.0124
+step   400  loss 3.6286
+step   600  loss 2.7718
+
+== order, 16 held-out outputs at each reasoning step
+steps         1       2       4       6       8
+exact  0/16    0/16    0/16    0/16    0/16    
+cells      0.0%    0.0%    0.0%    0.0%    0.0%
+monotone in R: True
+exit: 0
+wall_s: 1137
+end: Wed Sep  2 20:29:33 UTC 2026
+VmHWM:	    1948 kB

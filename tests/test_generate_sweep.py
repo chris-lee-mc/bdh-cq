@@ -23,7 +23,10 @@ def test_a1_expands_to_18_configs():
     jobs, meta = expand_sweep(A1)
     assert len(jobs) == 18  # 3 models x 2 tasks x 3 seeds
     assert meta["name"] == "a1_first_experiment"
-    assert len({j.hash for j in jobs}) == 18  # every job hashes distinctly
+    # The hash is seed-invariant (config.HASH_EXCLUDED_FIELDS): one hash per
+    # sweep arm, and (hash, seed) identifies a job.
+    assert len({j.hash for j in jobs}) == 6  # 3 models x 2 tasks
+    assert len({(j.hash, j.seed) for j in jobs}) == 18
 
 
 def test_seed_policy_refuses_below_3_without_dev(tmp_path):

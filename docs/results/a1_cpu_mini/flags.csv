@@ -1,0 +1,8 @@
+flag,config_hash,model,task,detail
+PROVISIONAL,e68f332f70b0,bdh,compose,n_seeds=3 < 5
+DEV,e68f332f70b0,bdh,compose,excluded from README-grade tables
+PROVISIONAL,cfcf40086811,bdh_cq,compose,n_seeds=3 < 5
+DEV,cfcf40086811,bdh_cq,compose,excluded from README-grade tables
+PROVISIONAL,47f4cb9be590,looped_transformer,compose,n_seeds=3 < 5
+DEV,47f4cb9be590,looped_transformer,compose,excluded from README-grade tables
+HIGH VAR,47f4cb9be590,looped_transformer,compose,"cv=1.41 (std=0.009, mean=0.007)"

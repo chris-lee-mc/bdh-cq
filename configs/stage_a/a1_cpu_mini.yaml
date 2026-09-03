@@ -1,0 +1,52 @@
+# Stage A, A1 CPU mini: a pipeline validation, NOT evidence.
+# Same axes as a1_first_experiment (three models on compose, 3 seeds) but at a
+# param and step budget that fits on 4 CPU cores. Models this small, trained
+# this briefly, are not expected to learn compose; the run exists to prove the
+# generate -> train -> evaluate -> aggregate path end to end on real configs.
+sweep:
+  name: a1_cpu_mini
+  stage: A
+  description: >
+    CPU-scale replica of A1: bdh vs bdh_cq vs looped_transformer at 205k params
+    on compose, R_train {1,2,4}, R_test {1,2,4,8,16}, 3 seeds, device cpu.
+base: configs/base/default.yaml
+dev: true
+grid:
+  model.name: [bdh, bdh_cq, looped_transformer]
+seeds: [1, 2, 3]
+overrides:
+  experiment.tags: [dev, cpu_mini]
+  model.params_target: 205_000
+  model.recurrence.kind: plain
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  task.name: compose
+  task.seed: 1000
+  task.train_difficulties: [{depth: 1}, {depth: 2}]
+  task.eval_difficulties:
+    interp: [{depth: 1}, {depth: 2}]
+    mild: [{depth: 3}, {depth: 4}]
+    strong: [{depth: 6}, {depth: 8}]
+  task.n_eval_episodes: 100
+  training.steps: 6000
+  training.batch_size: 16
+  training.precision: bf16          # no-op on cpu, kept to match a1_first_experiment
+  training.warmup_steps: 300
+  training.checkpoint_every_steps: 2000
+  training.eval_every_steps: 100000
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16]
+  evaluation.diagnostics: true
+  compute.device: cpu
+  compute.deterministic: true
+  compute.max_wall_clock_minutes: 10
+notes: >
+  params_target is 205_000, not the 150_000 a smaller budget would suggest:
+  with vocab 4128 the BDH width solver's smallest admissible width (16) already
+  costs 135k params and the next width (24) costs 205k, so 150_000 is outside
+  the 5 percent hard bound for bdh/bdh_cq. 205_000 is the smallest target all
+  three models hit within 0.2 percent (bdh/bdh_cq width 24, looped width 44).
+  Dev run. Tagged [dev, cpu_mini] so aggregate_results flags every row DEV and
+  excludes it from README-grade tables. eval_every_steps is set above the step
+  budget so each job pays for exactly one final evaluation.
