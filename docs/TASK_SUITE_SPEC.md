@@ -64,6 +64,31 @@ Requirements:
   episodes. The eval harness asserts this by re-sampling with the same
   rng seed and comparing.
 
+Known cost of the [ANSWER] marker, and the fix (measured, `RESULTS.md`
+section A0): predicting the first target token from the hidden state AT the
+[ANSWER] position is expensive, because that token is a constant and carries
+nothing about the query, so a sequence model must copy the query forward into
+that position before it can match it against the demonstrations. On `binding`
+at 1.5M parameters and 3000 steps this was the difference between exact match
+0.975 (readout at the query token) and 0.445 (readout at the constant marker
+token) in a standalone reference implementation; depth, head count, QKV
+biases, absolute position embeddings, an untied head, an auxiliary
+next-token loss and 4x the steps did not close it.
+
+Fixed: `[ANSWER]` stays in `serialize()`/`parse_serialized()` as a structural
+delimiter (so both stay lossless and multi-token targets stay unambiguous),
+but the sequence-native models (`SeqReasoner.forward_episode`/`solve` in
+`bdhx/models/transformer.py`, shared by `transformer`, `looped_transformer`,
+`unified_block`, `gated_deltanet`) no longer read the first target token from
+the [ANSWER] position. They read it from the hidden state at the last query
+token instead (`answer_start - 2` rather than `answer_start - 1`); every
+later target token still reads from the previous real target token as
+before, since only the first hop paid the marker's cost. `bdh` and `bdh_cq`
+never went through this path: their adapter feeds the query through BDH's
+native ingestion and decodes directly from the post-reasoning state, with no
+[ANSWER] token involved, so they were unaffected and are unchanged by this
+fix.
+
 ## 2. Task catalogue
 
 Each task lists: generator, difficulty knobs, train range, eval ranges,

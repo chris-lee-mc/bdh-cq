@@ -10,6 +10,8 @@ is selected by `model.memory.kind`:
 
 Recurrence depth is handled by the same `RecurrenceRunner` every other model
 uses, so memory kind and recurrence are the only variables across the 2x2.
+`model.depth` counts the layers inside the shared block, as in
+`looped_transformer.py` (FRAMEWORK_SPEC section 2).
 """
 
 from __future__ import annotations
@@ -69,8 +71,26 @@ class UnifiedBlock(nn.Module):
         return x + (self.post2(h) if self.sandwich_norm else h)
 
 
-def unified_params(width: int, vocab_size: int, memory_kind: str, sandwich_norm: bool) -> int:
-    blk = UnifiedBlock(width, memory_kind, sandwich_norm)
+class UnifiedStack(nn.Module):
+    """`depth` unified blocks applied in order: the unit the loop repeats."""
+
+    def __init__(self, width: int, depth: int, memory_kind: str, sandwich_norm: bool = False):
+        super().__init__()
+        self.depth = max(int(depth), 1)
+        self.layers = nn.ModuleList(
+            [UnifiedBlock(width, memory_kind, sandwich_norm) for _ in range(self.depth)]
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def unified_params(
+    width: int, vocab_size: int, memory_kind: str, sandwich_norm: bool, depth: int = 1
+) -> int:
+    blk = UnifiedStack(width, depth, memory_kind, sandwich_norm)
     return sum(p.numel() for p in blk.parameters()) + vocab_size * width + width
 
 
@@ -90,15 +110,17 @@ class UnifiedBlockModel(SeqReasoner):
         rec = model_cfg.recurrence
         kind = model_cfg.memory.kind
         r_max = max(int(r_max), 1)
+        depth = max(int(model_cfg.depth), 1)
         width = resolve_width(
             model_cfg,
             lambda w: (
-                unified_params(w, vocab_size, kind, sandwich_norm)
+                unified_params(w, vocab_size, kind, sandwich_norm, depth)
                 + recurrence_params(w, rec, r_max)
             ),
         )
         super().__init__(vocab_size, width, target_length)
-        self.block = UnifiedBlock(width, kind, sandwich_norm)
+        self.depth = depth
+        self.block = UnifiedStack(width, depth, kind, sandwich_norm)
         self.input_injection = bool(rec.input_injection)
         self.recurrence = RecurrenceRunner(
             self._apply_block,
@@ -114,10 +136,11 @@ class UnifiedBlockModel(SeqReasoner):
         return self.block(h + s if (self.input_injection and s is not None) else h)
 
     def _applications(self, reasoning_steps: int) -> int:
-        return max(int(reasoning_steps), 0)
+        """Layer applications: `depth` layers per reasoning step."""
+        return max(int(reasoning_steps), 0) * self.depth
 
     def _run(
         self, tokens: Tensor, reasoning_steps: int, collect_diagnostics: bool
     ) -> tuple[Tensor, dict[str, list]]:
-        s = self.embed(tokens.to(self.embed.weight.device))
+        s = self.embed_tokens(tokens)
         return self.recurrence(s, s, reasoning_steps, collect_diagnostics)

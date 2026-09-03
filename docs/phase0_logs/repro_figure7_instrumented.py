@@ -4,48 +4,56 @@
 # imported unmodified from the bdh_cq package.
 import random
 import time
+from itertools import pairwise
 
 import torch
-
 from bdh_cq.bdh_cq import BDHReasoningWrapper
-from bdh_cq.icq import (make_model, train_loss, task_at_level, task_prompt,
-                        ingest, generate_answer, decode_grid, cell_stats,
-                        CLASS_WEIGHTS)
+from bdh_cq.icq import (
+    CLASS_WEIGHTS,
+    cell_stats,
+    decode_grid,
+    generate_answer,
+    ingest,
+    make_model,
+    task_at_level,
+    task_prompt,
+    train_loss,
+)
 from bdh_cq.tasks import TASKS
 
 REASONING_STEPS_SWEEP = [1, 2, 4, 6, 8]
 MAX_REASONING_STEPS = 8
 
-SIZES = {
-    "propagation": 5,
-    "copy": 2,
-    "order": 4,
-    "nesting": 3
-}
+SIZES = {"propagation": 5, "copy": 2, "order": 4, "nesting": 3}
 
-LEVELS = {
-    "propagation": [2, 3, 4],
-    "copy": [2, 3],
-    "order": [3, 4],
-    "nesting": [2, 3]
-}
+LEVELS = {"propagation": [2, 3, 4], "copy": [2, 3], "order": [3, 4], "nesting": [2, 3]}
 
 
-def run(device="cpu", family="order", steps=300, seed=3,
-        write_prompt_to_memory=True, latent_step_embed=False, log_every=50):
+def run(
+    device="cpu",
+    family="order",
+    steps=300,
+    seed=3,
+    write_prompt_to_memory=True,
+    latent_step_embed=False,
+    log_every=50,
+):
     torch.manual_seed(seed)
     random.seed(seed)
 
     if device == "cpu":
         torch.set_num_threads(4)
 
-    wrapper = BDHReasoningWrapper(make_model(
-        dim=256,
-        depth=4,
-        dim_qk_heads=1024,
-        attn_residual=True,
-        attn_residual_depth_bias_distance=1
-    ), latent_step_embed=latent_step_embed).to(device)
+    wrapper = BDHReasoningWrapper(
+        make_model(
+            dim=256,
+            depth=4,
+            dim_qk_heads=1024,
+            attn_residual=True,
+            attn_residual_depth_bias_distance=1,
+        ),
+        latent_step_embed=latent_step_embed,
+    ).to(device)
 
     num_params = sum(p.numel() for p in wrapper.parameters())
     print(f"param count: {num_params}", flush=True)
@@ -58,13 +66,17 @@ def run(device="cpu", family="order", steps=300, seed=3,
 
     for step in range(steps):
         task_family = rng.choice(list(TASKS.values()))
-        task = task_family(
-            size=SIZES[task_family.name]
-        ).generate(seed=rng.randrange(2 ** 31))
+        task = task_family(size=SIZES[task_family.name]).generate(seed=rng.randrange(2**31))
 
         reasoning_steps = rng.randint(0, MAX_REASONING_STEPS)
 
-        loss = train_loss(wrapper, task, reasoning_steps, class_weights=CLASS_WEIGHTS, update_memory=write_prompt_to_memory)
+        loss = train_loss(
+            wrapper,
+            task,
+            reasoning_steps,
+            class_weights=CLASS_WEIGHTS,
+            update_memory=write_prompt_to_memory,
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(wrapper.parameters(), 1.0)
         opt.step()
@@ -96,7 +108,7 @@ def run(device="cpu", family="order", steps=300, seed=3,
                     seed=1_000_000 + task_index * 10_000 + level,
                     level=level,
                     n_tests=2,
-                    size=SIZES[family]
+                    size=SIZES[family],
                 )
 
                 memories = ingest(wrapper, task_prompt(task), update_memory=write_prompt_to_memory)
@@ -110,9 +122,8 @@ def run(device="cpu", family="order", steps=300, seed=3,
                         )
                         predicted = decode_grid(predicted)
 
-                        exact_match[reasoning_steps] += (
-                            predicted.shape == target.shape and
-                            bool((predicted == target).all())
+                        exact_match[reasoning_steps] += predicted.shape == target.shape and bool(
+                            (predicted == target).all()
                         )
                         correct, total, _ = cell_stats(predicted, target)
                         correct_cells[reasoning_steps] += correct
@@ -124,13 +135,20 @@ def run(device="cpu", family="order", steps=300, seed=3,
     print()
     print(f"== {family}, {num_outputs} held-out outputs at each reasoning step")
     print(f"{'steps':<7}" + "".join(f"{s:>8}" for s in REASONING_STEPS_SWEEP))
-    print(f"{'exact':<7}" + "".join(f"{exact_match[s]}/{num_outputs:<6}" for s in REASONING_STEPS_SWEEP))
-    print(f"{'cells':<7}" + "".join(
-        f"{correct_cells[s] / max(1, total_cells[s]) * 100:7.1f}%" for s in REASONING_STEPS_SWEEP
-    ))
+    print(
+        f"{'exact':<7}"
+        + "".join(f"{exact_match[s]}/{num_outputs:<6}" for s in REASONING_STEPS_SWEEP)
+    )
+    print(
+        f"{'cells':<7}"
+        + "".join(
+            f"{correct_cells[s] / max(1, total_cells[s]) * 100:7.1f}%"
+            for s in REASONING_STEPS_SWEEP
+        )
+    )
 
     cell_accuracy = [correct_cells[s] / max(1, total_cells[s]) for s in REASONING_STEPS_SWEEP]
-    print("monotone in R:", all(b >= a for a, b in zip(cell_accuracy, cell_accuracy[1:])))
+    print("monotone in R:", all(b >= a for a, b in pairwise(cell_accuracy)))
     print(f"\ntotal wall-clock (train+eval): {time.time() - t0:.1f}s")
 
 

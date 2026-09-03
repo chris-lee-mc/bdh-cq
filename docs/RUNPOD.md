@@ -5,12 +5,16 @@ itself is cloud-independent; this document describes the launcher and the
 operational rules for running sweeps on RunPod.
 
 Sourcing caveat: runpod.io and docs.runpod.io were not reachable from the
-research environment. SDK signatures below come from the public
-`runpod/runpod-python` repository and are considered reliable. Prices,
-preemption notice windows, network-volume rates, and region lists were
-triangulated from several 2026 third-party sources and MUST be re-checked
-against runpod.io/pricing and docs.runpod.io before the first paid sweep.
-Items known to be unverified are listed in section 10.
+research environment that wrote v0.1 of this document. SDK signatures below
+come from the public `runpod/runpod-python` repository and are considered
+reliable. Prices, preemption notice windows, network-volume rates, and
+region lists were triangulated from several 2026 third-party sources at
+that time.
+
+Re-checked 2026-09-03 (this session, runpod.io/docs.runpod.io reachable,
+plus the live `runpod` SDK against the account's `RUNPOD_API_KEY`): GPU
+prices for RTX A5000 and RTX 4090 and the network-volume rate below are now
+verified, not triangulated. See section 10 for what is still open.
 
 ## 1. Which hardware
 
@@ -20,13 +24,18 @@ tolerance, not VRAM.
 
 | GPU               | Community (spot-like) | Secure (on-demand) | Use                          |
 |-------------------|-----------------------|--------------------|------------------------------|
-| RTX A5000 24GB    | ~$0.16/hr             | ~$0.27/hr          | default for Stage A-D sweeps |
-| RTX 4090 24GB     | ~$0.34/hr             | ~$0.69-0.74/hr     | faster small jobs            |
+| RTX A5000 24GB    | $0.16/hr (verified)   | $0.27/hr (verified)| default for Stage A-D sweeps |
+| RTX 4090 24GB     | $0.34/hr (verified)   | $0.74/hr (verified)| faster small jobs            |
 | L4 24GB           | n/a                   | ~$0.39/hr          | alternative                  |
 | A40 48GB          | n/a                   | ~$0.44/hr          | 50M-150M models              |
 | L40S 48GB         | n/a                   | ~$0.99/hr          | 50M-150M models              |
 | A100 80GB PCIe    | ~$1.19/hr             | ~$1.39/hr          | not needed before 100M+      |
 | H100 80GB SXM     | ~$2.69/hr             | ~$2.99/hr          | not needed                   |
+
+A5000 and 4090 rates verified 2026-09-03 two ways: `runpod.get_gpu(gpu_id)`
+via the live SDK (`communityPrice`/`securePrice`/`lowestPrice`) and
+https://www.runpod.io/pricing, independently, exact agreement. The other
+rows are still the original third-party-triangulated estimates.
 
 Rules:
 
@@ -45,35 +54,55 @@ Rules:
 
 `docker/Dockerfile` pins everything. Skeleton:
 
+See `docker/Dockerfile` for the real file; the shape is:
+
 ```dockerfile
-FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu
+FROM runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2404
 ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
-# torch is provided by the base image; assert its version at build time
-RUN python -c "import torch; assert torch.__version__.startswith('2.8.0'), torch.__version__"
-COPY pyproject.toml uv.lock /app/
 WORKDIR /app
-RUN pip install uv && uv pip install --system -r pyproject.toml --extra gpu
+RUN pip install --no-cache-dir uv
+COPY pyproject.toml uv.lock /app/
+RUN uv export --frozen --no-hashes --no-emit-project \
+        --extra gpu --extra s3 --extra runpod -o /tmp/requirements.txt \
+ && grep -vE '^(torch|triton|nvidia-)' /tmp/requirements.txt > /tmp/requirements-nocuda.txt \
+ && uv pip install --system --no-deps -r /tmp/requirements-nocuda.txt
+RUN uv pip install --system --no-deps \
+        "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"
 COPY . /app
-RUN uv pip install --system -e . --no-deps
+RUN uv pip install --system --no-deps -e .
+RUN python -c "import torch; assert torch.__version__.startswith('2.8.0'), torch.__version__" \
+ && python -c "import triton, fla; print('triton', triton.__version__)"
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 ```
 
-- `uv.lock` pins every dependency, including `triton` and
-  `flash-linear-attention` (Gated DeltaNet baseline). Triton needs the
-  CUDA driver on the host, which the RunPod image provides. Smoke-test in
-  the built image before any sweep:
+- Base image tag: verified 2026-09-03 against the `runpod/pytorch` tag list
+  on Docker Hub. The tag this document used to quote
+  (`2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu`) DOES NOT EXIST;
+  `1.1.0-cu1281-torch280-ubuntu2404` is the newest stable (non-rc) tag with
+  torch 2.8.0 on CUDA 12.8.1 (linux/amd64, about 11.7 GB compressed). Re-check
+  the tag list at build time: RunPod has changed the naming scheme before.
+- `uv.lock` pins every dependency. It is exported and installed with
+  `--no-deps` so the resolved versions are used verbatim and nothing is
+  re-resolved at build time. `torch`, `triton` and `nvidia-*` are filtered
+  out on purpose: the base image ships them built against its own driver and
+  CUDA, and `uv lock` (which cannot know that) resolves torch to the newest
+  release, so installing them from the lock would replace the image's CUDA
+  stack with a generic wheel. The two asserts are what prove the filter held.
+- The community `bdh-cq` package stays a separate step rather than a lock
+  entry, matching how `tools/runpod_launch.py`'s inline startup command
+  installs it.
+- Build context is the repo root:
+  `docker build -f docker/Dockerfile -t ghcr.io/<owner>/bdhx:<git-sha> .`
+  then `docker push`. The image tag is the git SHA; the launcher records it.
+- Local smoke test (CPU-only machines use `--device cpu`, which the entrypoint
+  turns into a `compute.device` override):
+  `docker run --rm -e RUN_ID=smoke -e CONFIG_PATH=configs/base/tiny_smoke.yaml
+  ghcr.io/<owner>/bdhx:<sha> --device cpu`.
+- Smoke-test the GPU stack in the built image before any sweep:
   `python -c "import triton, fla; print(triton.__version__)"` plus one
-  tiny `GatedDeltaNet` forward on GPU.
-- Build and push: `docker build -t ghcr.io/<owner>/bdhx:<git-sha> .` then
-  `docker push`. The image tag is the git SHA; the launcher records it.
-- Local smoke test (CPU-only machines use `--device cpu`):
-  `docker run --rm --gpus all -e RUN_ID=smoke -e RUNPOD_API_KEY=dummy
-  ghcr.io/<owner>/bdhx:<sha> --config configs/base/tiny_smoke.yaml`.
-- Check the current `runpod/pytorch` tags on Docker Hub at build time; tag
-  naming has changed between schemes (for example
-  `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`).
+  tiny `GatedDeltaNet` forward on GPU (the import half runs at build time).
 
 Secrets: `RUNPOD_API_KEY`, S3 credentials, and any logging tokens are
 environment variables only. `pyproject.toml`, configs, and docker files
@@ -91,58 +120,108 @@ Two tiers:
    an alternative) as the authoritative store for checkpoints, results,
    and metadata. `S3_BUCKET` and credentials arrive through env vars.
 
-Protocol (implemented in `bdhx/training/trainer.py` and
-`tools/sync_checkpoint.py`):
+S3 is OPTIONAL and currently OFF: no bucket is configured for this project,
+so runs write only to local disk and `runpod_launch.py collect` pulls them
+over scp. Everything below is what happens once `S3_BUCKET` is set.
+
+Protocol (implemented in `bdhx/s3sync.py`, driven by
+`bdhx/training/trainer.py`, `tools/sync_checkpoint.py` and
+`tools/fetch_latest_checkpoint.py`):
 
 - Checkpoint every `checkpoint_every_steps` (default 1000 steps) AND at
   least every 5 minutes of wall clock, whichever comes first. Checkpoints
-  for models this size are megabytes, so the upload is synchronous.
+  for models this size are megabytes, so the upload is synchronous. Both
+  triggers already live in `Trainer.save_checkpoint`; the upload rides on
+  its `on_checkpoint` hook rather than keeping a second schedule.
 - Write local, upload to `s3://<bucket>/runs/<run_id>/ckpt_<step>.pt`,
-  then update `latest.json` (checkpoint key, step, config hash) with a
-  write-then-rename, then delete local checkpoints older than the last two.
+  then update `latest.json` (checkpoint key, step, config hash), then
+  delete checkpoints older than the last two, locally and in the bucket.
+  Steps in keys are zero padded to 8 digits so a plain listing is in
+  numeric order.
+- On "write-then-rename" for `latest.json`: object stores have no atomic
+  rename, and none of R2, B2 or the RunPod volume API offer one. What the
+  requirement buys is that a reader never sees a pointer to a checkpoint
+  that is not fully stored, and a single S3 PutObject is already atomic at
+  the object level. So ORDERING is the guarantee: the checkpoint object is
+  stored first, and only then is `latest.json` overwritten. A crash between
+  the two leaves an orphan checkpoint (harmless, pruned later), never a
+  dangling pointer. The local pointer, where rename does exist, uses
+  `os.replace` literally.
 - On start, the entrypoint fetches `latest.json` for `RUN_ID`. If present
   and the config hash matches, training resumes with model, optimizer,
   scheduler, and rng states; `metadata.json` increments `preemptions`.
   A hash mismatch aborts (never silently train a different config under
-  an old run id).
+  an old run id) with exit code 3, which is never retried. A transport
+  error exits 1 and is also fatal: treating an unreachable bucket as a cold
+  start would restart at step 0 and then overwrite `latest.json`.
 - Results (`results.json`, `train_log.csv`, `metadata.json`, logs) are
   uploaded at the end and after each evaluation.
 
-Network volumes: about $0.07/GB-month (unverified). They are region
-pinned; if used, create the volume in a region that also supports the
-S3-compatible API (reported: EUR-IS-1, EU-RO-1, EU-CZ-1, US-KS-2, US-CA-2;
-verify).
+Credentials and endpoint are environment variables only:
+
+| variable | meaning |
+|----------|---------|
+| `S3_BUCKET` | bucket name; on RunPod, the network volume id. Unset or empty disables sync entirely |
+| `S3_ENDPOINT_URL` | `https://<account>.r2.cloudflarestorage.com`, `https://s3.<region>.backblazeb2.com`, or `https://s3api-<DATACENTER>.runpod.io/`. Unset means real AWS S3 |
+| `S3_REGION` | `auto` for R2, the datacenter id for RunPod; falls back to `AWS_DEFAULT_REGION` / `AWS_REGION` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | read by botocore itself. For RunPod these are the user id (`user_...`) and the S3 API key secret (`rps_...`), which are NOT the normal RunPod API key |
+
+Two client settings are mandatory for non-AWS endpoints and are set in
+`bdhx/s3sync.make_client`:
+
+- `request_checksum_calculation` and `response_checksum_validation` are
+  forced to `when_required`. Since botocore 1.36 the default is to send an
+  `x-amz-checksum-crc32` header on every PutObject; Cloudflare R2 and
+  Backblaze B2 both reject it, which would fail every upload.
+- path-style addressing, because a virtual-host bucket name is not routable
+  on the R2 / B2 / RunPod endpoint hostnames.
+
+RunPod's own S3 API additionally does not support bucket creation, ACLs,
+object tagging, encryption, presigned URLs or versioning; this protocol uses
+none of them.
+
+Network volumes, verified 2026-09-03 against docs.runpod.io/pods/pricing and
+www.runpod.io/pricing (agreed exactly): $0.07/GB-month standard tier under
+1TB, $0.05/GB-month standard over 1TB, $0.14/GB-month high-performance tier.
+They are region pinned; if used, create the volume in a region that also
+supports the S3-compatible API. Verified 2026-09-03 against
+docs.runpod.io/storage/s3-api, full list: EU-CZ-1, EU-RO-1, EUR-IS-1,
+EUR-NO-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-MD-1, US-MO-1, US-MO-2,
+US-NC-1, US-NC-2, US-NE-1, US-WA-1 (endpoint pattern
+`https://s3api-<DATACENTER>.runpod.io/`).
 
 ## 4. Entrypoint (`docker/entrypoint.sh`)
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-: "${RUN_ID:?}"; : "${S3_BUCKET:?}"; : "${CONFIG_PATH:?}"; : "${MAX_SECONDS:=10800}"
-[[ "${DETERMINISTIC:-0}" == "1" ]] && export CUBLAS_WORKSPACE_CONFIG=":4096:8"
-mkdir -p /workspace/runs/$RUN_ID/meta
-nvidia-smi > /workspace/runs/$RUN_ID/meta/nvidia-smi.txt || true
-python tools/fetch_latest_checkpoint.py --bucket "$S3_BUCKET" --run-id "$RUN_ID" \
-    --dest /workspace/runs/$RUN_ID || true
-set +e
-timeout --signal=TERM "${MAX_SECONDS}s" python tools/run_experiment.py \
-    --config "$CONFIG_PATH" --run-id "$RUN_ID" --resume \
-    --out /workspace/runs/$RUN_ID --sync-bucket "$S3_BUCKET"
-TRAIN_EXIT=$?
-set -e
-python tools/sync_checkpoint.py --bucket "$S3_BUCKET" --run-id "$RUN_ID" --final || true
-python - <<'PY'
-import os, runpod
-runpod.api_key = os.environ["RUNPOD_API_KEY"]
-runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
-PY
-exit "$TRAIN_EXIT"
-```
+See `docker/entrypoint.sh` for the real file. Required environment is
+`RUN_ID` and `CONFIG_PATH`; `MAX_SECONDS` defaults to 10800. Behaviour:
 
-The self-terminate step runs unconditionally. `RUNPOD_POD_ID` is injected
-by RunPod; `RUNPOD_API_KEY` is not and must be passed via `env` in
-`create_pod` (use a narrowly scoped key). If `timeout` fires, the trainer
-has already checkpointed, so relaunching the same `RUN_ID` resumes.
+- `S3_BUCKET` set: fetch `latest.json` and resume if the hash matches, train
+  with `--sync-bucket`, then a final `sync_checkpoint.py --final`.
+- `S3_BUCKET` unset or empty: train straight to `/workspace/runs/$RUN_ID` and
+  leave the results there for `runpod_launch.py collect`. This is the default
+  today and it is why the entrypoint no longer hard-requires a bucket.
+
+Three details that differ from the original draft, each for a reason:
+
+- The fetch is NOT run under `|| true`. A transport error is not the same as
+  "no checkpoint": swallowing it would restart the run from step 0 and then
+  overwrite `latest.json`, destroying real progress. Exit 3 (config hash
+  mismatch) and exit 1 (transport) both stop the pod.
+- `--resume` is passed only when `checkpoints/latest.json` exists, because
+  `--resume` with no checkpoint is a hard error in the trainer.
+- `--out` is the runs ROOT (`/workspace/runs`), not the run directory:
+  `run_experiment.py` appends the run id itself, so passing the run directory
+  produced `/workspace/runs/<id>/<id>`.
+
+Extra arguments are forwarded to `run_experiment.py`, with `--device <dev>`
+translated to a `compute.device` override so the section 2 local smoke test
+works as written.
+
+The self-terminate step runs only when both `RUNPOD_POD_ID` (injected by
+RunPod) and `RUNPOD_API_KEY` are present. The launcher does not hand the
+account key to every pod, so in practice termination is done by
+`runpod_launch.py reap` / `watchdog`. If `timeout` fires, the trainer has
+already checkpointed, so relaunching the same `RUN_ID` resumes.
 
 ## 5. Launcher (`tools/runpod_launch.py`)
 
@@ -167,7 +246,7 @@ Subcommands and behaviour:
 | subcommand | behaviour |
 |------------|-----------|
 | `estimate <generated/sweep>` | reads `manifest.csv` GPU-minute estimates (from `profile_config.py`), multiplies by the rate table in `configs/runpod_rates.yaml`, prints jobs, GPU-hours, USD |
-| `launch <generated/sweep>` | refuses above `--max-gpu-hours` (default 20) or above `--max-jobs` (default 12) without `--allow-large-sweep`; respects `--max-concurrent`; appends every created pod to `runpod_state.jsonl` BEFORE returning |
+| `launch <generated/sweep>` | refuses above `--max-gpu-hours` (default 20) or above `--max-jobs` (default 12) without `--allow-large-sweep`; respects `--max-concurrent`; appends every created pod to `runpod_state.jsonl` BEFORE returning; `--s3-bucket` opts the jobs into the section 3 sync (default: local disk plus `collect`) |
 | `status` | polls `get_pod` for tracked pods; classifies RUNNING / EXITED / MISSING; MISSING with an incomplete `latest.json` is queued for relaunch with the same `RUN_ID` |
 | `relaunch` | relaunches queued jobs (resume is automatic) |
 | `watchdog` | terminates any tracked pod whose uptime exceeds 1.5x its `MAX_SECONDS`; run as a loop or cron |
@@ -195,6 +274,7 @@ Keep `run_experiment.py` launcher-agnostic so either path works.
 ## 6. Sweep workflow
 
 ```
+python tools/sanity_learnability.py                                       # MANDATORY gate, must exit 0
 python tools/generate_sweep.py configs/stage_a/a1_first_experiment.yaml   # -> generated/a1_first_experiment/
 python tools/profile_config.py generated/a1_first_experiment/exp_000.yaml --device cuda
 python tools/runpod_launch.py estimate generated/a1_first_experiment
@@ -206,6 +286,13 @@ python tools/runpod_launch.py reap --prefix bdhx-a1_first_experiment
 ```
 
 Each generated config is an independent job. Seeds are separate jobs.
+
+`tools/sanity_learnability.py` is the first line and is not optional
+(`HANDOFF_TASKS.md` task 23b): it runs on the CPU of the launching machine in
+about four minutes and refuses the sweep when the pipeline trains without
+learning. After collecting, check `reports/<date>/flags.csv` for `AT_CHANCE`
+rows before reading any accuracy number; an `AT_CHANCE` run is a failed run
+whatever its exact-match column says.
 
 ## 7. Reproducibility inside the job
 
@@ -260,14 +347,57 @@ Community Cloud. The scale-up phases (S1 at 2M-25M, then 50M, then
 
 ## 10. Unverified items (re-check before first paid sweep)
 
-- All prices and the network-volume $/GB-month rate.
-- Community Cloud interruption notice window.
-- REST API base URL; the GraphQL endpoint is the reliable path.
-- `runpodctl pod create` flag for a startup command (use the SDK's
-  `docker_args` or a template instead).
-- Whether the SDK auto-reads `RUNPOD_API_KEY` (set `runpod.api_key`
-  explicitly regardless).
-- Triton and flash-linear-attention inside `runpod/pytorch` images
-  (smoke-test the built image).
-- `create_template` signature.
-- S3-API region list for network volumes.
+Re-checked 2026-09-03 (this session; no RunPod MCP server was connected in
+this session despite the task briefing expecting one, so this used the
+`runpod` Python SDK plus direct fetches of runpod.io/docs.runpod.io):
+
+- ~~All prices and the network-volume $/GB-month rate.~~ VERIFIED: A5000 and
+  4090 Community/Secure rates (section 1) and network-volume rate
+  (section 3), both two ways (live SDK `get_gpu()` and the public pricing
+  page, or the public pricing page and docs page), exact agreement each
+  time. L4/A40/L40S/A100/H100 rows remain the original estimate.
+- Community Cloud interruption notice window: STILL UNVERIFIED. Neither
+  runpod.io/pricing, docs.runpod.io/pods/pricing, nor
+  docs.runpod.io/pods/manage-pods states a notice period, guaranteed or
+  otherwise, for Community Cloud preemption. Treat this as confirmation of
+  the conservative assumption already in section 1 (near-zero notice,
+  checkpointing is the safety net), not as a new number.
+- REST API base URL: not re-checked; the GraphQL endpoint
+  (`https://api.runpod.io/graphql`, used throughout this document) remains
+  the reliable path and is what the launcher uses.
+- `runpodctl pod create` flag for a startup command: not needed for the
+  simplest-pod approach (SDK `create_pod` with a stock image and an `env`
+  dict); not re-checked.
+- Whether the SDK auto-reads `RUNPOD_API_KEY`: not re-checked; continue to
+  set `runpod.api_key` explicitly, which works regardless.
+- Triton and flash-linear-attention inside `runpod/pytorch` images: not yet
+  checked from this session (needs an actual GPU pod); still the first thing
+  to test on the first provisioned pod.
+- `create_template` signature: not re-checked; not needed for the
+  simplest-pod approach, which calls `create_pod` directly without a
+  template.
+- ~~S3-API region list for network volumes.~~ VERIFIED 2026-09-03 against
+  docs.runpod.io/storage/s3-api: see section 3 for the full list (larger
+  than the originally reported five regions).
+
+Added 2026-09-03 while implementing task 21:
+
+- ~~The `runpod/pytorch` base image tag.~~ VERIFIED against the Docker Hub
+  tag list: the previously quoted tag does not exist; section 2 now pins
+  `1.1.0-cu1281-torch280-ubuntu2404`.
+- The image has NOT been built. The base image is about 11.7 GB compressed
+  and roughly 22 GB extracted, which did not fit the free disk of the
+  environment task 21 was implemented in. What was verified instead: the tag
+  exists for linux/amd64, and the dependency-install lines (the `uv export`,
+  the CUDA-stack filter and `uv pip install --no-deps`) were run verbatim in
+  a real container build on a small base image, confirming they install the
+  framework, boto3 and the RunPod SDK while leaving torch/triton/nvidia-* out.
+  The remaining unknown is the base-image half: whether torch is 2.8.0 there
+  and whether `triton` and `fla` import. Both are asserted at build time, so
+  the first real `docker build` answers them.
+- No S3-compatible bucket has ever been contacted. `bdhx/s3sync.py` and its
+  two CLIs are unit-tested against a fake client only. Endpoint, region,
+  path-style addressing and the checksum settings come from vendor
+  documentation (see section 3), not from a live round trip. Do one manual
+  `sync_checkpoint.py` / `fetch_latest_checkpoint.py` round trip against the
+  real bucket before trusting a sweep to it.

@@ -93,7 +93,7 @@ model:
   name: bdh_cq                  # registry key
   params_target: 10_000_000     # width solver hits this within 3 percent
   width: null                   # set explicitly to bypass the solver
-  depth: 4                      # number of distinct layers (1 for shared)
+  depth: 2                      # layers applied per reasoning step (see below)
   precision_state: bf16         # recurrent state dtype (H8)
   recurrence:
     kind: plain                 # plain | residual | step_gate | init_skip | step_emb | adapter | attn_residual | combo
@@ -147,6 +147,26 @@ compute:
 
 Rules:
 
+- `model.depth` is the number of block layers applied **per reasoning step**.
+  The field name is unchanged; its meaning is stated once here and holds for
+  every model:
+  - fixed-depth baselines (`transformer`, `gated_deltanet`): `depth` distinct
+    layers, applied once per episode (R is fixed at 1);
+  - looped models (`looped_transformer`, `unified_block`): `depth` layers
+    *inside the shared block*, and the shared block is applied R times, so the
+    layer count is `R * depth` (plus the optional `prelude`/`coda` layers,
+    constructor arguments that default to 0 and run once before and after the
+    loop);
+  - BDH models (`bdh`, `bdh_cq`): `depth` is passed straight through to the
+    community `BDH(depth=...)` argument, which applies the shared `BDHBlock`
+    that many times per forward pass; `bdh_cq` then runs R latent steps, so its
+    layer count is `R * depth` as well. The community default is 4
+    (`icq.MODEL_KWARGS`, `figure7.py`); our default of 2 is the cheapest value
+    that keeps every model comparable, and 4 is the documented alternative.
+  The default is 2, not 1: a looped model at `depth: 1` applies a single layer
+  per step, and one layer cannot express an induction-style match-and-copy no
+  matter how many times it is repeated. `depth: 1` was the cause of the
+  flat-at-chance Stage A dev runs (`RESULTS.md` section A0).
 - `params_target` triggers `param_budget.solve_width()`, which searches
   the width so that trainable parameters land within 3 percent of target.
   The realized count and the solved width are written to the results
@@ -215,7 +235,10 @@ instruction):
 
 All variants share the same block `F` and differ only in the update rule.
 `H_0` is the initial latent state after ingestion; `S` is the query
-injection (present at every step when `input_injection: true`).
+injection (present at every step when `input_injection: true`). For the looped
+Transformer family `F` is the whole `model.depth`-layer shared stack, not one
+layer: the update rules below act on the stack's output, and the recurrence
+kinds are counted in reasoning steps, never in layers.
 
 | kind      | update rule                                      | extra params        |
 |-----------|--------------------------------------------------|---------------------|
@@ -327,6 +350,13 @@ has `step, loss, lr, grad_norm, r_train, examples_seen, wall_s, vram`.
 
 - AdamW, cosine schedule with warmup, grad clipping, bf16 autocast with
   fp32 master weights and fp32 loss.
+- Before any sweep, `tools/sanity_learnability.py` must exit 0
+  (`HANDOFF_TASKS.md` task 23b). It trains `transformer` and
+  `looped_transformer` on `binding` for 3000 CPU steps and requires exact match
+  >= 0.9 on the `interp` n_bindings=1 cell plus a final loss below the
+  `AT_CHANCE` plateau. It is the guard against the class of defect that
+  produced `RESULTS.md` section A0: a pipeline that runs, writes valid results
+  and learns nothing.
 - Per batch, sample `R_train` from `reasoning.train_steps` according to
   `train_step_sampling`; log it.
 - Curriculum: `curriculum.schedule` and `switch_at` fractions; delayed
@@ -375,7 +405,13 @@ produces:
 
 - `all_runs.csv` (one row per evaluation row per run), `summary.csv`
   (grouped by config hash and evaluation key, seed statistics),
-  `flags.csv` (matching/variance/convergence warnings).
+  `flags.csv` (matching/variance/convergence warnings). `flags.csv` carries
+  `NOT MATCHED`, `PROVISIONAL`, `DEV`, `DIVERGED`, `HIGH VAR`, `UNCONVERGED`
+  and `AT_CHANCE`. `AT_CHANCE` fires when a run's final `train_log.csv` loss is
+  still within 3 percent of `ln(vocab_size)`: the run never left the
+  uniform-prediction plateau and its evaluation numbers mean nothing. Any
+  `AT_CHANCE` row invalidates the table it appears in; fix the run before
+  reporting it.
 - Plots (PNG + the CSV backing each):
   1. `acc_vs_reasoning_steps_<task>.png` (one line per model, per split;
      vertical marker at max R_train)

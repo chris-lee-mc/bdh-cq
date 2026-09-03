@@ -1,0 +1,19 @@
+param count: 794145
+step     0  loss 5.0565  elapsed     0.3s
+step    50  loss 2.8393  elapsed    25.5s
+step   100  loss 3.4531  elapsed    47.1s
+step   150  loss 3.0820  elapsed    67.9s
+step   200  loss 3.0062  elapsed    91.4s
+step   250  loss 3.5617  elapsed   111.5s
+step   299  loss 3.1918  elapsed   129.8s
+
+total training wall-clock: 129.9s for 300 steps
+eval wall-clock: 40.4s
+
+== order, 16 held-out outputs at each reasoning step
+steps         1       2       4       6       8
+exact  0/16    0/16    0/16    0/16    0/16    
+cells      0.0%    0.0%    0.0%    0.0%    0.0%
+monotone in R: True
+
+total wall-clock (train+eval): 170.3s

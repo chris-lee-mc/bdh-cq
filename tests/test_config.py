@@ -35,6 +35,17 @@ def test_hash_stable_across_key_order():
     assert canonical_yaml(a) == canonical_yaml(b)
 
 
+def test_hash_ignores_training_seed_only():
+    """Seeds of one sweep arm share a hash so aggregate.py can group them."""
+    a = Config.model_validate({**BASE, "training": {"steps": 10, "batch_size": 4, "seed": 1}})
+    b = Config.model_validate({**BASE, "training": {"steps": 10, "batch_size": 4, "seed": 2}})
+    assert config_hash(a) == config_hash(b)
+    assert canonical_yaml(a) != canonical_yaml(b)  # the full record still keeps it
+    # Any other axis, including the task seed, still separates experiments.
+    c = Config.model_validate({**BASE, "task": {"name": "compose", "seed": 2000}})
+    assert config_hash(a) != config_hash(c)
+
+
 def test_underscore_numbers_and_string_ints():
     c = Config.model_validate({**BASE, "model": {"name": "m", "params_target": "10_000_000"}})
     assert c.model.params_target == 10_000_000

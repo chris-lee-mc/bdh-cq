@@ -155,7 +155,7 @@ def test_unified_block_bdh_mixer():
     m = UnifiedBlockModel(mcfg("unified_block", memory_kind="bdh"), V, target_length=2, r_max=4)
     out = m.solve(tokens(), 3)
     assert out.logits.shape == (2, 2, V)
-    assert type(m.block.mixer).__name__ == "BDHBlock"
+    assert type(m.block.layers[0].mixer).__name__ == "BDHBlock"
 
 
 def test_forward_episode_and_flops():

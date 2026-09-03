@@ -1,0 +1,16 @@
+flag,config_hash,model,task,detail
+PROVISIONAL,347edd786918,bdh,compose,n_seeds=3 < 5
+DEV,347edd786918,bdh,compose,excluded from README-grade tables
+PROVISIONAL,2d9d96fc3b3d,bdh_cq,compose,n_seeds=3 < 5
+DEV,2d9d96fc3b3d,bdh_cq,compose,excluded from README-grade tables
+PROVISIONAL,b749571dfa56,looped_transformer,compose,n_seeds=3 < 5
+DEV,b749571dfa56,looped_transformer,compose,excluded from README-grade tables
+AT_CHANCE,2d9d96fc3b3d,bdh_cq,compose,final train loss 8.376 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,2d9d96fc3b3d,bdh_cq,compose,final train loss 8.390 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,2d9d96fc3b3d,bdh_cq,compose,final train loss 8.372 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,347edd786918,bdh,compose,final train loss 8.401 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,347edd786918,bdh,compose,final train loss 8.352 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,347edd786918,bdh,compose,final train loss 8.449 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,b749571dfa56,looped_transformer,compose,final train loss 8.358 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,b749571dfa56,looped_transformer,compose,final train loss 8.272 is within 3% of ln(vocab)=8.326: the run learned nothing
+AT_CHANCE,b749571dfa56,looped_transformer,compose,final train loss 8.362 is within 3% of ln(vocab)=8.326: the run learned nothing

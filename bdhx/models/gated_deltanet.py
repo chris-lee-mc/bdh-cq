@@ -154,7 +154,7 @@ class GatedDeltaNetModel(SeqReasoner):
     def _run(
         self, tokens: Tensor, reasoning_steps: int, collect_diagnostics: bool
     ) -> tuple[Tensor, dict[str, list]]:
-        h = self.embed(tokens.to(self.embed.weight.device))
+        h = self.embed_tokens(tokens)
         diag = {k: [] for k in ("state_norm", "update_norm", "cos_consecutive", "nan_count")}
         for blk in self.blocks:
             prev = h

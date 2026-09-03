@@ -7,9 +7,16 @@ inference-time compute scaling, parameter efficiency, and training
 stability, against matched baselines (looped Transformer, Transformer,
 Gated DeltaNet).
 
-This repository is self-contained. It currently holds the plan and
-specifications; the code described in the specs is the next deliverable
-(see `docs/HANDOFF_TASKS.md`).
+This repository is self-contained. Stage 0 (framework, tasks, model
+adapters, trainer, evaluation, tools, RunPod launcher) is implemented and
+tested; see `docs/HANDOFF_TASKS.md` for what is done and what remains, and
+`docs/RESULTS.md` for the results ledger, currently CPU pipeline-validation
+runs plus the GPU sweeps in progress.
+
+Before launching any sweep, run `python tools/sanity_learnability.py`; it
+must exit 0 (`docs/HANDOFF_TASKS.md` task 23b). It trains two baselines on
+the `binding` task for 3000 CPU steps and fails when the pipeline runs but
+learns nothing, which is exactly what the first Stage A dev sweep did.
 
 Read in this order:
 
@@ -27,7 +34,7 @@ Read in this order:
    safety.
 7. `docs/HANDOFF_TASKS.md`: ordered implementation tasks with acceptance
    tests.
-8. `docs/RESULTS.md`: results ledger (empty until Stage A).
+8. `docs/RESULTS.md`: results ledger, updated after every stage.
 9. `configs/`: sweep definitions for Stages A-D.
 
 Ground rules: one variable per experiment, matched parameters and FLOPs,
