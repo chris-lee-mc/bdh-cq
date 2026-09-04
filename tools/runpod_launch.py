@@ -510,7 +510,14 @@ def relaunch(
     if client is None:
         client = _default_client()
 
-    rows = status(state_path, client=client)
+    sweep = Path(generated_dir).name
+    # Scoped to this sweep: an unfiltered state file mixes in unrelated runs
+    # (other sweeps, one-off verification pods) whose QUEUED/MISSING records
+    # would otherwise compete for this sweep's relaunch slots and skew its
+    # running-pod count -- found live, when a stale verification-pod record
+    # (a different GPU type with no stock) won a relaunch slot ahead of an
+    # actual sweep job sitting right behind it in the queue.
+    rows = [r for r in status(state_path, client=client) if r.get("sweep") == sweep]
     running = sum(1 for r in rows if r["state"] == "RUNNING")
     slots = max(0, max_concurrent - running)
     to_relaunch = [r for r in rows if r["state"] in ("QUEUED", "MISSING") and r["run_id"]]

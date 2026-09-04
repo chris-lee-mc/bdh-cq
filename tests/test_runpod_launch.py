@@ -338,6 +338,40 @@ def test_relaunch_resumes_same_run_id_after_missing_pod(tmp_path):
     assert row["run_id"] == created[0].run_id
 
 
+def test_relaunch_ignores_queued_jobs_from_a_different_sweep(tmp_path):
+    """Regression test: relaunch() used to consider every QUEUED/MISSING
+    record in the whole state file, so an unrelated sweep's (or a one-off
+    verification pod's) queued record could win a relaunch slot ahead of
+    this sweep's own job sitting right behind it in the queue. Found live
+    while launching the real A1 sweep: a stale verification-pod record
+    (a GPU type with no stock) grabbed the only slot and the real job never
+    got tried that round.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    # queue a job under an unrelated sweep name, positioned first in the file
+    append_state(
+        PodRecord(
+            sweep="other_sweep",
+            exp="exp_000",
+            run_id="other_h0_s0",
+            pod_id=None,
+            gpu_type="g",
+            cloud_type="COMMUNITY",
+            max_seconds=600,
+            config_path="generated/other_sweep/exp_000.yaml",
+            name="bdhx-other_sweep-exp_000",
+        ),
+        state_path,
+    )
+    launch(d, git_ref="x", max_concurrent=0, client=client, state_path=state_path, dry_run=True)
+
+    relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    assert len(relaunched) == 1
+    assert relaunched[0].sweep == "toy_sweep"  # not the other sweep's job
+
+
 def test_watchdog_terminates_pods_over_grace_period(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
