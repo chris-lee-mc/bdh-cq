@@ -37,9 +37,30 @@ via the live SDK (`communityPrice`/`securePrice`/`lowestPrice`) and
 https://www.runpod.io/pricing, independently, exact agreement. The other
 rows are still the original third-party-triangulated estimates.
 
+Re-verified 2026-09-03 a third way through the RunPod MCP server
+(`list-gpu-types`): same four numbers again, and it also reports live stock.
+Availability at that check:
+
+| GPU        | Community $/hr | stock  | CUDA 12.8 |
+|------------|----------------|--------|-----------|
+| RTX A5000  | 0.16           | NONE   | no        |
+| RTX A4000  | 0.17           | LOW    | no        |
+| RTX A4500  | 0.19           | LOW    | yes       |
+| RTX 3090   | 0.22           | MEDIUM | yes       |
+| RTX 4090   | 0.34           | HIGH   | yes       |
+
+RTX A5000, the default this document assumed, was out of stock on BOTH
+Community and Secure with no CUDA version available. `tools/runpod_launch.py`
+therefore defaults to `NVIDIA GeForce RTX 4090` on Community: it is the
+cheapest capable GPU with HIGH stock and CUDA 12.8, and at roughly twice the
+throughput of an A5000 its cost per job is close to the A5000 planning
+number. Stock moves; re-check with `list-gpu-types` before every sweep rather
+than trusting this table.
+
 Rules:
 
-- Default: RTX A5000 or RTX 4090 on Community Cloud, one job per GPU.
+- Default: RTX 4090 on Community Cloud, one job per GPU (A5000 while it has
+  stock; it had none on 2026-09-03).
   Parallelize across seeds and configs, never across GPUs for one run.
 - Use Secure Cloud only when a job is long enough that restarts would
   cost more than the price premium (rule of thumb: runs above 3 hours).
@@ -93,7 +114,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 - The community `bdh-cq` package stays a separate step rather than a lock
   entry, matching how `tools/runpod_launch.py`'s inline startup command
   installs it.
-- Build context is `bdh-cq-experiments/`:
+- Build context is the repository root:
   `docker build -f docker/Dockerfile -t ghcr.io/<owner>/bdhx:<git-sha> .`
   then `docker push`. The image tag is the git SHA; the launcher records it.
 - Local smoke test (CPU-only machines use `--device cpu`, which the entrypoint
@@ -359,9 +380,11 @@ this session despite the task briefing expecting one, so this used the
 - Community Cloud interruption notice window: STILL UNVERIFIED. Neither
   runpod.io/pricing, docs.runpod.io/pods/pricing, nor
   docs.runpod.io/pods/manage-pods states a notice period, guaranteed or
-  otherwise, for Community Cloud preemption. Treat this as confirmation of
-  the conservative assumption already in section 1 (near-zero notice,
-  checkpointing is the safety net), not as a new number.
+  otherwise, for Community Cloud preemption. Re-checked 2026-09-03 through
+  the MCP server as well: it exposes no preemption-notice field on any pod or
+  GPU-type response, so there is nothing to read even from the API. Treat
+  this as confirmation of the conservative assumption already in section 1
+  (near-zero notice, checkpointing is the safety net), not as a new number.
 - REST API base URL: not re-checked; the GraphQL endpoint
   (`https://api.runpod.io/graphql`, used throughout this document) remains
   the reliable path and is what the launcher uses.
@@ -379,6 +402,18 @@ this session despite the task briefing expecting one, so this used the
 - ~~S3-API region list for network volumes.~~ VERIFIED 2026-09-03 against
   docs.runpod.io/storage/s3-api: see section 3 for the full list (larger
   than the originally reported five regions).
+
+Added 2026-09-03 by the first session with a connected MCP server:
+
+- ~~Prices via a third independent source.~~ VERIFIED through the RunPod MCP
+  server's `list-gpu-types`: A5000 0.16/0.27 and 4090 0.34/0.74, matching the
+  SDK and the pricing page exactly. See section 1.
+- NEW, and it changes the default: RTX A5000 stock is NONE on both clouds.
+  Section 1 now carries a live availability table and the launcher default
+  moved to RTX 4090 Community.
+- The REST v2 API is what the MCP server speaks; the GraphQL endpoint this
+  document describes still works and is still what the SDK-based launcher
+  uses. No change to the launcher was needed for this.
 
 Added 2026-09-03 while implementing task 21:
 

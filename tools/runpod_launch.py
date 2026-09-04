@@ -50,11 +50,13 @@ from bdhx.config import PROJECT_ROOT
 
 DEFAULT_STATE_FILE = PROJECT_ROOT / "runpod_state.jsonl"
 DEFAULT_RATES_FILE = PROJECT_ROOT / "configs" / "runpod_rates.yaml"
-DEFAULT_IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu"
-DEFAULT_GPU_TYPE = "NVIDIA RTX A5000"
+DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2404"
+# RTX A5000 was the documented default but has been out of stock on both
+# Community and Secure since at least 2026-09-03; the 4090 is the cheapest
+# capable GPU with real stock. Override with --gpu-type.
+DEFAULT_GPU_TYPE = "NVIDIA GeForce RTX 4090"
 DEFAULT_CLOUD_TYPE = "COMMUNITY"
-REPO_URL = "https://github.com/chris-lee-mc/prism-llama-cpu-kernels"
-REPO_SUBDIR = "bdh-cq-experiments"
+REPO_URL = "https://github.com/chris-lee-mc/bdh-cq"
 
 RUNNING_STATUSES = {"RUNNING"}
 TERMINAL_STATUSES = {"EXITED", "TERMINATED"}
@@ -236,7 +238,6 @@ def build_docker_args(cfg: PodRecord, git_ref: str, *, s3_bucket: str | None = N
         "cd /workspace; "
         f"if [ ! -d repo ]; then git clone --depth 200 {REPO_URL} repo; fi; "
         f"cd repo && git fetch origin {git_ref} && git checkout {git_ref} && "
-        f"cd {REPO_SUBDIR} && "
         'pip install -q -e ".[gpu]" && '
         'pip install -q "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"; '
         f"{fetch}"
@@ -317,7 +318,7 @@ def launch(
             continue  # already launched (or queued) this run_id; use relaunch for retries
         name = f"bdhx-{sweep}-{job.exp}"
         rel = os.path.relpath(generated_dir, PROJECT_ROOT)
-        config_path = f"{REPO_SUBDIR}/{rel}/{job.exp}.yaml"
+        config_path = f"{rel}/{job.exp}.yaml"
         rec = PodRecord(
             sweep=sweep,
             exp=job.exp,

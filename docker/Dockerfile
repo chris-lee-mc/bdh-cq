@@ -1,6 +1,6 @@
 # Image for RunPod jobs (docs/RUNPOD.md section 2).
 #
-# Build from the bdh-cq-experiments directory, which is the build context:
+# Build from the repository root, which is the build context:
 #   docker build -f docker/Dockerfile -t bdhx:$(git rev-parse --short HEAD) .
 #
 # Base image tag: RunPod renamed these between schemes, and the tag the spec

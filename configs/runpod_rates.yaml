@@ -1,12 +1,20 @@
 # Hand-maintained $/hour table used by tools/runpod_launch.py estimate.
-# A5000 and 4090 rates verified 2026-09-03 directly against the runpod
-# Python SDK's get_gpu() (live GraphQL) and https://www.runpod.io/pricing;
-# both sources agreed exactly. The rest are carried over from the original
-# third-party-sourced estimate and are not yet independently re-checked.
+# A5000 and 4090 rates verified 2026-09-03 three ways: the runpod Python
+# SDK's get_gpu() (live GraphQL), https://www.runpod.io/pricing, and the
+# RunPod MCP server's list-gpu-types; all three agreed exactly. The rest are
+# carried over from the original third-party-sourced estimate and are not yet
+# independently re-checked.
+#
+# This table is prices only. It says nothing about stock: RTX A5000 was at
+# zero availability on both clouds on 2026-09-03, which is why the launcher
+# default is the 4090. Check stock with list-gpu-types before every sweep.
 as_of: 2026-09-03
 rates:
-  "NVIDIA RTX A5000": {COMMUNITY: 0.16, SECURE: 0.27}       # verified 2026-09-03
+  "NVIDIA RTX A5000": {COMMUNITY: 0.16, SECURE: 0.27}       # verified 2026-09-03; no stock
   "NVIDIA GeForce RTX 4090": {COMMUNITY: 0.34, SECURE: 0.74} # verified 2026-09-03
+  "NVIDIA GeForce RTX 3090": {COMMUNITY: 0.22, SECURE: 0.50} # verified 2026-09-03 (MCP)
+  "NVIDIA RTX A4000": {COMMUNITY: 0.17, SECURE: 0.25}        # verified 2026-09-03 (MCP)
+  "NVIDIA RTX A4500": {COMMUNITY: 0.19, SECURE: 0.25}        # verified 2026-09-03 (MCP)
   "NVIDIA L4": {SECURE: 0.39}
   "NVIDIA A40": {SECURE: 0.44}
   "NVIDIA L40S": {SECURE: 0.99}

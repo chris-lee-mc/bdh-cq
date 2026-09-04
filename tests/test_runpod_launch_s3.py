@@ -27,7 +27,7 @@ def record() -> PodRecord:
         gpu_type="NVIDIA RTX A5000",
         cloud_type="COMMUNITY",
         max_seconds=600,
-        config_path="bdh-cq-experiments/generated/toy_sweep/exp_000.yaml",
+        config_path="generated/toy_sweep/exp_000.yaml",
         name="bdhx-toy_sweep-exp_000",
     )
 
@@ -83,7 +83,7 @@ def test_fetch_runs_before_the_trainer_and_gates_it():
 
 def test_fetch_checks_the_config_so_a_reused_run_id_cannot_resume_silently():
     cmd = build_docker_args(record(), GIT_REF, s3_bucket="my-bucket")
-    assert "--config bdh-cq-experiments/generated/toy_sweep/exp_000.yaml" in cmd
+    assert "--config generated/toy_sweep/exp_000.yaml" in cmd
     assert "--run-id h0_s1 --dest /workspace/runs/h0_s1" in cmd
 
 

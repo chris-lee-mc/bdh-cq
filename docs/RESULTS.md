@@ -168,24 +168,42 @@ two blocks, so the only difference is weight sharing across reasoning steps.
 The same two configurations were flat at exactly ln(4128) before the fixes,
 with the looped Transformer starting from a training loss of 219.
 
-`n_bindings >= 2` is *not* solved by any model here (0.48 to 0.70 for the
-Transformer family, against 0.50 for guessing between the two demonstrated
-values), and that is a property of the serialization rather than a remaining
-defect. `TASK_SUITE_SPEC` section 1 puts an [ANSWER] marker between the query
-and the target, so the answer is predicted from a position whose own token
-carries no information about the query: the model must copy the key forward
-into each value position, copy the query forward into the [ANSWER] position,
-and only then match. A standalone 2-layer reference implementation outside
-this framework reproduces the effect exactly and isolates it to that one
-token: with the readout at the query token (`k1 v1 k2 v2 q`) it reaches 0.975
-exact match in 3000 steps, and appending a single constant token
-(`k1 v1 k2 v2 q [ANSWER]`) drops it to 0.445. Depth 2, 3, 4 and 6, one to
-eight attention heads, QKV biases, learned absolute position embeddings, an
-untied head, an auxiliary next-token loss over the whole prompt, and 12000
-steps instead of 3000 all leave it at chance-between-the-candidates; only
-moving the query to the readout position fixes it. This is a real limit of
-these models at this scale, not a broken pipeline, and it is why the sanity
-gate is set on n_bindings=1.
+#### The fourth defect: the readout position (found here, fixed)
+
+`n_bindings >= 2` was *not* solved by any model in the run above (0.48 to
+0.70 for the Transformer family, against 0.50 for guessing between the two
+demonstrated values). That turned out to be a property of the serialization
+rather than a limit of the models. `TASK_SUITE_SPEC` section 1 puts an
+[ANSWER] marker between the query and the target, so the answer was predicted
+from a position whose own token carries no information about the query: the
+model had to copy the key forward into each value position, copy the query
+forward into the [ANSWER] position, and only then match. A standalone 2-layer
+reference implementation outside this framework reproduced the effect exactly
+and isolated it to that one token: with the readout at the query token
+(`k1 v1 k2 v2 q`) it reaches 0.975 exact match in 3000 steps, and appending a
+single constant token (`k1 v1 k2 v2 q [ANSWER]`) drops it to 0.445. Depth 2,
+3, 4 and 6, one to eight attention heads, QKV biases, learned absolute
+position embeddings, an untied head, an auxiliary next-token loss over the
+whole prompt, and 12000 steps instead of 3000 all left it at
+chance-between-the-candidates; only moving the query to the readout position
+fixed it.
+
+Fixed: `SeqReasoner.forward_episode`/`solve` now read the first target token
+from the hidden state at the last query token (`answer_start - 2`) instead of
+at the [ANSWER] token. [ANSWER] stays in `serialize()`/`parse_serialized()` as
+a structural delimiter, so both stay lossless and multi-token targets stay
+unambiguous, and every later target token still reads from the previous real
+target token because only the first hop paid the marker's cost. This touches
+`transformer`, `looped_transformer`, `unified_block` and `gated_deltanet`;
+`bdh` and `bdh_cq` feed the query through BDH's native ingestion with no
+[ANSWER] token involved and are unchanged. In the same one-seed sanity run,
+n_bindings=2 moved from 0.20-0.36 to 0.48-1.00. The sanity gate stays set on
+n_bindings=1, which both gated models now solve at exact match 1.000.
+
+The measurement above still stands as the reason the fix exists, and the
+absolute accuracies in the A0 tables were produced before it: they are
+floored by the extra hop and should not be compared against anything measured
+after this commit.
 
 #### BDH and BDH-CQ on the same check (dev, not evidence)
 
