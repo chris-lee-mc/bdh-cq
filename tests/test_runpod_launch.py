@@ -705,6 +705,85 @@ def test_collect_terminate_on_collect_only_after_success(tmp_path):
     assert created[0].pod_id in client.pods  # not terminated: nothing was collected
 
 
+def test_collect_marks_the_run_done_so_relaunch_does_not_retrain_it(tmp_path):
+    """Regression test: found live on the real A1 sweep. `status()` used to
+    have no terminal state -- a pod terminated by `collect(terminate_on_collect
+    =True)` then reads back as MISSING (get_pod() fails to resolve it), which
+    is exactly the state relaunch() treats as needing a retry. Three already-
+    collected A1 jobs got brand-new pods created for them, and were retrained
+    from scratch, on the very next relaunch() call.
+    """
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    run_id = created[0].run_id
+
+    def fake_fetch(url, dest):
+        src = tmp_path / "src" / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text('{"exact_match": 1.0}')
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(src, arcname=run_id)
+        return True
+
+    result = collect(
+        d,
+        tmp_path / "out",
+        state_path=state_path,
+        client=client,
+        fetch=fake_fetch,
+        terminate_on_collect=True,
+    )
+    assert result["pulled"] == [run_id]
+    assert created[0].pod_id not in client.pods  # terminated, as requested
+
+    rows = status(state_path=state_path, client=client)
+    done_row = next(r for r in rows if r["run_id"] == run_id)
+    assert done_row["state"] == "DONE"
+
+    # max_concurrent=1 means the other two manifest jobs are legitimately
+    # still QUEUED (never launched in the first place) and relaunch() is
+    # right to backfill the slot the DONE job's termination freed up -- the
+    # bug this test guards against is the DONE job itself getting relaunched.
+    relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    assert run_id not in [r.run_id for r in relaunched]  # not retrained
+
+
+def test_reap_stuck_boots_leaves_done_runs_alone(tmp_path):
+    """A DONE run's pod is already terminated; reap_stuck_boots must not
+    requeue it just because it looks old with no booted ports."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    run_id = created[0].run_id
+    append_state(
+        PodRecord(
+            sweep=d.name,
+            exp=created[0].exp,
+            run_id=run_id,
+            pod_id=created[0].pod_id,
+            gpu_type=created[0].gpu_type,
+            cloud_type=created[0].cloud_type,
+            max_seconds=created[0].max_seconds,
+            config_path=created[0].config_path,
+            created_at=0.0,  # far in the past
+            done=True,
+        ),
+        state_path,
+    )
+    del client.pods[created[0].pod_id]  # collect() would have terminated it
+
+    requeued = reap_stuck_boots(state_path=state_path, client=client, boot_grace_seconds=1)
+    assert requeued == []
+
+    rows = status(state_path=state_path, client=client)
+    assert next(r for r in rows if r["run_id"] == run_id)["state"] == "DONE"
+
+
 def test_pod_proxy_url_format():
     from tools.runpod_launch import pod_proxy_url
 

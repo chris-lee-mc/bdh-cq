@@ -218,6 +218,7 @@ class PodRecord:
     created_at: float = field(default_factory=time.time)
     name: str = ""
     sweep_config_path: str = ""
+    done: bool = False
 
 
 def append_state(record: PodRecord, state_path: Path = DEFAULT_STATE_FILE) -> None:
@@ -504,6 +505,16 @@ def status(state_path: Path = DEFAULT_STATE_FILE, client=None) -> list[dict]:
 
     rows = []
     for rec in latest_state_by_run_id(state_path).values():
+        if rec.get("done"):
+            # Collected successfully. There is no separate "terminated
+            # cleanly" signal from the RunPod API -- a pod that no longer
+            # resolves via get_pod() looks identical whether it finished and
+            # was reaped or it simply vanished, so without this explicit
+            # marker a collected job reads back as MISSING and relaunch()
+            # retrains it from scratch. Found live: three already-collected
+            # A1 jobs got brand-new pods on the very next relaunch() call.
+            rows.append({**rec, "state": "DONE"})
+            continue
         if not rec.get("pod_id"):
             rows.append({**rec, "state": "QUEUED"})
             continue
@@ -643,7 +654,7 @@ def reap_stuck_boots(
     now = time.time()
     requeued = []
     for run_id, rec in latest_state_by_run_id(state_path).items():
-        if not rec.get("pod_id"):
+        if rec.get("done") or not rec.get("pod_id"):
             continue
         age = now - rec.get("created_at", now)
         if age < boot_grace_seconds:
@@ -777,6 +788,22 @@ def collect(
             tar_path.unlink(missing_ok=True)
         _flatten_double_nested_run_dir(out_dir / run_id)
         pulled.append(run_id)
+        append_state(
+            PodRecord(
+                sweep=rec.get("sweep", sweep),
+                exp=rec.get("exp", ""),
+                run_id=run_id,
+                pod_id=rec.get("pod_id"),
+                gpu_type=rec.get("gpu_type", ""),
+                cloud_type=rec.get("cloud_type", ""),
+                max_seconds=rec.get("max_seconds", 0),
+                config_path=rec.get("config_path", ""),
+                name=rec.get("name", ""),
+                sweep_config_path=rec.get("sweep_config_path", ""),
+                done=True,
+            ),
+            state_path,
+        )
         if terminate_on_collect:
             try:
                 client.terminate_pod(rec["pod_id"])
