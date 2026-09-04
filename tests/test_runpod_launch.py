@@ -275,6 +275,22 @@ def test_launch_passes_escaped_docker_args_to_create_pod(tmp_path):
     assert '"' in decoded  # the raw script does contain quotes -- that's what broke it unescaped
 
 
+def test_launch_threads_sweep_config_path_into_the_startup_command(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
+    )
+    sent = client.last_create_kwargs["docker_args"]
+    decoded = json.loads(f'"{sent}"')
+    assert "generate_sweep.py configs/stage_a/a1_first_experiment.yaml" in decoded
+
+
 def test_docker_args_never_contains_api_key():
     from tools.runpod_launch import PodRecord
 
@@ -291,6 +307,52 @@ def test_docker_args_never_contains_api_key():
     args = build_docker_args(rec, "deadbeef")
     assert "RUNPOD_API_KEY" not in args
     assert "h0_s1" in args and "cfg.yaml" in args
+
+
+def test_docker_args_regenerates_the_sweep_when_sweep_config_path_is_set():
+    """Regression test: generated/ is gitignored, so a pod's fresh clone
+    never has cfg.config_path on disk. Found live: the first real sweep job
+    failed with FileNotFoundError on exactly this path. build_docker_args
+    must regenerate it on the pod when sweep_config_path is given.
+    """
+    from tools.runpod_launch import PodRecord
+
+    rec = PodRecord(
+        sweep="a1_first_experiment",
+        exp="exp_000",
+        run_id="h0_s1",
+        pod_id=None,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=100,
+        config_path="generated/a1_first_experiment/exp_000.yaml",
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
+    )
+    args = build_docker_args(rec, "deadbeef")
+    assert "tools/generate_sweep.py configs/stage_a/a1_first_experiment.yaml" in args
+    assert "--out generated/a1_first_experiment" in args
+    # the regen step must run before run_experiment.py reads its output
+    assert args.index("generate_sweep.py") < args.index("run_experiment.py")
+
+
+def test_docker_args_omits_regen_when_sweep_config_path_is_unset():
+    """Backward-compat: a PodRecord without sweep_config_path (e.g. an old
+    state-file record) must not gain a broken regen step out of nowhere.
+    """
+    from tools.runpod_launch import PodRecord
+
+    rec = PodRecord(
+        sweep="s",
+        exp="exp_000",
+        run_id="h0_s1",
+        pod_id=None,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=100,
+        config_path="cfg.yaml",
+    )
+    args = build_docker_args(rec, "deadbeef")
+    assert "generate_sweep.py" not in args
 
 
 # -- status / relaunch / watchdog ----------------------------------------

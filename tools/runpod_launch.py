@@ -216,6 +216,7 @@ class PodRecord:
     config_path: str
     created_at: float = field(default_factory=time.time)
     name: str = ""
+    sweep_config_path: str = ""
 
 
 def append_state(record: PodRecord, state_path: Path = DEFAULT_STATE_FILE) -> None:
@@ -293,6 +294,20 @@ def build_docker_args(
             f"--run-id {cfg.run_id} --dest {out_dir} --config {cfg.config_path} && "
         )
         sync = f"--sync-bucket {s3_bucket} "
+    # generated/ is gitignored (it is generated output, not source), so a
+    # fresh clone never has cfg.config_path on disk. Found live: the first
+    # real sweep job failed with FileNotFoundError on exactly this path.
+    # generate_sweep.py is a pure function of its source YAML (verified: two
+    # runs from the same commit produce byte-identical output), so
+    # regenerating it on the pod reproduces the same exp_NNN.yaml files
+    # rather than needing to transfer them.
+    regen = ""
+    if cfg.sweep_config_path:
+        sweep_out_dir = os.path.dirname(cfg.config_path)
+        regen = (
+            f"python tools/generate_sweep.py {cfg.sweep_config_path} "
+            f"--out {sweep_out_dir} --max-gpu-hours 1e9; "
+        )
     return (
         "bash -lc '"
         "set -uo pipefail; "
@@ -305,6 +320,7 @@ def build_docker_args(
         f"{'cd ' + REPO_SUBDIR + ' && ' if REPO_SUBDIR else ''}"
         'pip install -q -e ".[gpu]" && '
         'pip install -q "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"; '
+        f"{regen}"
         f"{fetch}"
         f"timeout --signal=TERM {cfg.max_seconds}s python tools/run_experiment.py "
         f"--config {cfg.config_path} --run-id {cfg.run_id} --resume "
@@ -373,7 +389,18 @@ def launch(
     client=None,
     dry_run: bool = False,
     s3_bucket: str | None = None,
+    sweep_config_path: str = "",
 ) -> list[PodRecord]:
+    """`sweep_config_path` (e.g. "configs/stage_a/a1_first_experiment.yaml") is
+    the source YAML `generated_dir` was expanded from. `generated/` is
+    gitignored, so a pod's fresh clone never has the generated exp_NNN.yaml
+    files on disk; passing this lets build_docker_args() regenerate them on
+    the pod (generate_sweep.py is a pure function of this file, verified
+    deterministic). Omit it only for a generated_dir the pod can reach some
+    other way -- every job launched without it will fail with
+    FileNotFoundError on cfg.config_path, which is exactly what happened the
+    first time this project tried to launch a real sweep.
+    """
     if client is None:
         client = _default_client()
 
@@ -413,6 +440,7 @@ def launch(
             max_seconds=max_seconds,
             config_path=config_path,
             name=name,
+            sweep_config_path=sweep_config_path,
         )
         if launched_this_call >= slots or dry_run:
             append_state(rec, state_path)  # QUEUED: no pod_id yet
@@ -534,6 +562,7 @@ def relaunch(
             max_seconds=r.get("max_seconds", max_seconds),
             config_path=r["config_path"],
             name=r.get("name", f"bdhx-{r['sweep']}-{r['exp']}"),
+            sweep_config_path=r.get("sweep_config_path", ""),
         )
         docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
         try:
@@ -758,6 +787,13 @@ def main(argv: list[str] | None = None) -> int:
     p_launch.add_argument("--image", default=DEFAULT_IMAGE)
     p_launch.add_argument("--dry-run", action="store_true")
     p_launch.add_argument(
+        "--sweep-config-path",
+        default="",
+        help="source YAML generated_dir was expanded from (e.g. "
+        "configs/stage_a/a1_first_experiment.yaml); required for the pod to "
+        "regenerate exp_NNN.yaml, since generated/ is gitignored",
+    )
+    p_launch.add_argument(
         "--s3-bucket",
         default=None,
         help="opt in to off-pod checkpoint sync (RUNPOD.md section 3); "
@@ -812,6 +848,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             image=args.image,
             dry_run=args.dry_run,
             s3_bucket=args.s3_bucket,
+            sweep_config_path=args.sweep_config_path,
         )
         launched = sum(1 for r in created if r.pod_id)
         print(f"{launched} pods created, {len(created) - launched} queued")
