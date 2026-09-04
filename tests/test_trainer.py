@@ -122,6 +122,22 @@ def test_checkpoint_resume(tiny_cfg, tmp_path):
     assert len(rows) == 21  # header plus 20 steps, the resume appends
 
 
+def test_resume_with_no_checkpoint_yet_starts_fresh_instead_of_raising(tiny_cfg, tmp_path):
+    """Regression test: found live launching the real A1 sweep. runpod_launch.py
+    always passes --resume (it has no way to know in advance whether a job is
+    a first launch or a retry after preemption), so `resume=True` with an
+    empty run_dir is the ordinary case for every job's first attempt, not an
+    error -- it used to raise FileNotFoundError there, which would have
+    crashed every job in the sweep on its very first try.
+    """
+    cfg, model, task = make(tiny_cfg, **{"training.steps": 5})
+    trainer = Trainer(cfg, model, task, tmp_path / "run", resume=True)
+    assert trainer.state.step == 0
+    assert trainer.state.resumed_from is None
+    final = trainer.train()
+    assert final.step == 5  # trained normally, not blocked
+
+
 def _interrupt_at(trainer, step: int):
     """Runs `trainer.train()` with a SIGTERM raised at the end of `step`."""
     original = trainer.train_step
