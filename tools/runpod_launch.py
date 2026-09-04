@@ -67,6 +67,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bdhx.config import PROJECT_ROOT
 
+
+def _default_client():
+    """The real `runpod` module, with `api_key` set from RUNPOD_API_KEY.
+
+    The SDK does NOT auto-read RUNPOD_API_KEY from the environment (verified
+    against the live API: every `client=None` call site failed with
+    "No API key provided" until this was added, even with the env var set).
+    RUNPOD.md section 10 flagged this as unverified; it is now verified false.
+    """
+    import runpod
+
+    if not runpod.api_key:
+        runpod.api_key = os.environ.get("RUNPOD_API_KEY")
+    return runpod
+
+
 DEFAULT_STATE_FILE = PROJECT_ROOT / "runpod_state.jsonl"
 DEFAULT_RATES_FILE = PROJECT_ROOT / "configs" / "runpod_rates.yaml"
 DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2404"
@@ -359,7 +375,7 @@ def launch(
     s3_bucket: str | None = None,
 ) -> list[PodRecord]:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     generated_dir = Path(generated_dir)
     sweep = generated_dir.name
@@ -438,7 +454,7 @@ def classify(pod: dict | None) -> str:
 
 def status(state_path: Path = DEFAULT_STATE_FILE, client=None) -> list[dict]:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     rows = []
     for rec in latest_state_by_run_id(state_path).values():
@@ -475,7 +491,7 @@ def relaunch(
     s3_bucket: str | None = None,
 ) -> list[PodRecord]:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     rows = status(state_path, client=client)
     running = sum(1 for r in rows if r["state"] == "RUNNING")
@@ -519,7 +535,7 @@ def relaunch(
 
 def watchdog(state_path: Path = DEFAULT_STATE_FILE, client=None, grace: float = 1.5) -> list[str]:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     terminated = []
     for r in status(state_path, client=client):
@@ -562,7 +578,7 @@ def reap_stuck_boots(
     have been, for a pod that never booted). Returns the run_ids requeued.
     """
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     now = time.time()
     requeued = []
@@ -593,7 +609,7 @@ def reap_stuck_boots(
 
 def reap(prefix: str, client=None) -> dict:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     pods = client.get_pods()
     matched = [p for p in pods if str(p.get("name", "")).startswith(prefix)]
@@ -647,7 +663,7 @@ def collect(
     network call the same way `client` fakes the RunPod SDK.
     """
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     sweep = Path(generated_dir).name
     out_dir = Path(out_dir)
