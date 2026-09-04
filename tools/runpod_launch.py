@@ -54,6 +54,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -707,6 +708,29 @@ def _http_fetch(url: str, dest: Path, timeout: int = 120) -> bool:
     return result.returncode == 0
 
 
+def _flatten_double_nested_run_dir(run_dir: Path) -> None:
+    """Undo the double-nesting build_docker_args()'s --out produces.
+
+    The pod's --out is /workspace/runs/<run_id>, but run_experiment.py's own
+    main() does `run_dir = Path(args.out) / run_id`, so results actually land
+    in .../<run_id>/<run_id>/ -- one extra level `tar czf` then preserves.
+    aggregate_results.py's walk_runs() looks for `<run_id>/results.json`
+    exactly one level under results_root, so left alone this silently drops
+    every job from the report. Found live, on the first 3 jobs the real A1
+    sweep collected. Fixing build_docker_args() would only help jobs
+    launched after the fix while leaving already-launched jobs inconsistent
+    with it (some already had this exact --out baked into their running
+    pod's docker_args) -- flattening here instead handles every job in the
+    sweep uniformly, launched under the old command or a fixed one alike.
+    """
+    nested = run_dir / run_dir.name
+    if not nested.is_dir():
+        return
+    for item in nested.iterdir():
+        shutil.move(str(item), str(run_dir / item.name))
+    nested.rmdir()
+
+
 def collect(
     generated_dir: Path,
     out_dir: Path,
@@ -751,6 +775,7 @@ def collect(
             continue
         finally:
             tar_path.unlink(missing_ok=True)
+        _flatten_double_nested_run_dir(out_dir / run_id)
         pulled.append(run_id)
         if terminate_on_collect:
             try:

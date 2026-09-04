@@ -647,6 +647,44 @@ def test_collect_fetches_and_extracts_tarball(tmp_path):
     assert not (out_dir / f"{run_id}.tar.gz").exists()  # tarball cleaned up
 
 
+def test_collect_flattens_the_double_nested_run_dir(tmp_path):
+    """Regression test: build_docker_args()'s --out is /workspace/runs/<run_id>,
+    but run_experiment.py's own main() does `Path(args.out) / run_id`, so the
+    tarball actually contains <run_id>/<run_id>/results.json, one level
+    deeper than aggregate_results.py's walk_runs() looks
+    (`results_root.glob("*/results.json")`, exactly one level). Found live:
+    the first 3 jobs the real A1 sweep collected were nested this way and
+    would have been silently dropped from every report.
+    """
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    run_id = created[0].run_id
+
+    def fake_fetch(url, dest):
+        # what the pod's `tar czf <run_id>.tar.gz <run_id>` actually produces:
+        # <run_id>/<run_id>/... , not <run_id>/...
+        src = tmp_path / "src" / run_id / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text('{"exact_match": 1.0}')
+        (src / "checkpoints").mkdir()
+        (src / "checkpoints" / "step_00001000.pt").write_bytes(b"fake")
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(tmp_path / "src" / run_id, arcname=run_id)
+        return True
+
+    out_dir = tmp_path / "out"
+    result = collect(d, out_dir, state_path=state_path, client=client, fetch=fake_fetch)
+    assert result["pulled"] == [run_id]
+    # flattened: results.json directly under out_dir/<run_id>/, not nested
+    assert (out_dir / run_id / "results.json").read_text() == '{"exact_match": 1.0}'
+    assert (out_dir / run_id / "checkpoints" / "step_00001000.pt").exists()
+    assert not (out_dir / run_id / run_id).exists()  # nested dir removed
+
+
 def test_collect_terminate_on_collect_only_after_success(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
