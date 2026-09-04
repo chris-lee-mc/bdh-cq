@@ -15,12 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.runpod_launch import (
     DEFAULT_RATES_FILE,
     ManifestJob,
+    PodRecord,
+    append_state,
     build_docker_args,
     collect,
     estimate,
     launch,
     read_manifest,
     reap,
+    reap_stuck_boots,
     relaunch,
     status,
     watchdog,
@@ -319,6 +322,88 @@ def test_watchdog_leaves_pods_within_grace_period(tmp_path):
     pod["uptimeSeconds"] = 10 * 60 * 1.2  # under 1.5x
     terminated = watchdog(state_path, client=client)
     assert terminated == []
+
+
+# -- reap_stuck_boots ------------------------------------------------------
+
+
+def _backdated_record(client, run_id="h0_s0", age_seconds=900, booted=True):
+    """A pod created `age_seconds` ago via create_pod, its state record backdated."""
+    pod = client.create_pod(name=f"bdhx-toy-{run_id}")
+    pod_id = pod["id"]
+    if not booted:
+        client.pods[pod_id]["runtime"]["ports"] = []
+    import time
+
+    rec = PodRecord(
+        sweep="toy",
+        exp="exp_000",
+        run_id=run_id,
+        pod_id=pod_id,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=600,
+        config_path="generated/toy/exp_000.yaml",
+        name=f"bdhx-toy-{run_id}",
+        created_at=time.time() - age_seconds,
+    )
+    return rec, pod_id
+
+
+def test_reap_stuck_boots_requeues_pods_past_grace_with_no_ports(tmp_path):
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    rec, pod_id = _backdated_record(client, age_seconds=900, booted=False)
+    append_state(rec, state_path)
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == [rec.run_id]
+    assert pod_id not in client.pods  # terminated
+
+    rows = status(state_path, client=client)
+    assert [r["state"] for r in rows if r["run_id"] == rec.run_id] == ["QUEUED"]
+
+
+def test_reap_stuck_boots_leaves_recently_created_pods_alone(tmp_path):
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    rec, pod_id = _backdated_record(client, age_seconds=30, booted=False)
+    append_state(rec, state_path)
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == []
+    assert pod_id in client.pods  # left running -- still within the boot grace window
+
+
+def test_reap_stuck_boots_leaves_booted_pods_alone_regardless_of_age(tmp_path):
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    rec, pod_id = _backdated_record(client, age_seconds=99999, booted=True)
+    append_state(rec, state_path)
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == []
+    assert pod_id in client.pods
+
+
+def test_reap_stuck_boots_then_relaunch_picks_up_the_same_run_id(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    stuck_run_id = created[0].run_id
+    client.pods[created[0].pod_id]["runtime"]["ports"] = []
+    # backdate the just-launched record past the grace window
+    rows = [json.loads(line) for line in state_path.read_text().splitlines()]
+    rows[0]["created_at"] -= 900
+    state_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == [stuck_run_id]
+
+    relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    assert len(relaunched) == 1
+    assert relaunched[0].run_id == stuck_run_id  # same run_id -- --resume still applies
 
 
 # -- reap -----------------------------------------------------------------

@@ -29,6 +29,13 @@ upload. Credentials are forwarded from the launcher's own environment (see
 `s3_env`), never stored in a config or the state file. Untested against a real
 bucket: no S3 credentials exist for this project yet.
 
+Community Cloud showed a third failure mode this launcher has to plan for,
+distinct from both of the above and from ordinary preemption: a pod stuck at
+desiredStatus=RUNNING, uptimeSeconds=0, no exposed ports, indefinitely --
+the container simply never starts. watchdog() cannot catch this (uptime
+never exceeds anything because it never leaves 0); reap_stuck_boots() does,
+on a separate boot-side grace period.
+
 Usage:
     python tools/runpod_launch.py estimate generated/a1_first_experiment
     python tools/runpod_launch.py launch generated/a1_first_experiment \\
@@ -36,6 +43,7 @@ Usage:
     python tools/runpod_launch.py status
     python tools/runpod_launch.py relaunch generated/a1_first_experiment
     python tools/runpod_launch.py watchdog
+    python tools/runpod_launch.py reap-stuck-boots
     python tools/runpod_launch.py collect generated/a1_first_experiment --out results/
     python tools/runpod_launch.py reap --prefix bdhx-a1_first_experiment
 """
@@ -526,6 +534,60 @@ def watchdog(state_path: Path = DEFAULT_STATE_FILE, client=None, grace: float = 
     return terminated
 
 
+def _has_booted(pod: dict | None) -> bool:
+    """Whether a pod's container has actually started (any exposed port bound).
+
+    Observed repeatedly on Community Cloud (3/3 attempts during this
+    project's own verification): a pod can sit at desiredStatus=RUNNING,
+    uptimeSeconds=0, runtime=None indefinitely -- the container never
+    starts, no image pull progress, nothing. watchdog() cannot catch this:
+    uptimeSeconds never exceeds anything because it never leaves 0. Secure
+    Cloud never showed this failure mode (ports appeared within ~90s every
+    time). This is the boot-side counterpart to watchdog()'s training-side
+    timeout.
+    """
+    if pod is None:
+        return False
+    return bool((pod.get("runtime") or {}).get("ports"))
+
+
+def reap_stuck_boots(
+    state_path: Path = DEFAULT_STATE_FILE, client=None, boot_grace_seconds: int = 600
+) -> list[str]:
+    """Terminate and requeue pods that never booted within `boot_grace_seconds`.
+
+    Requeuing means appending a fresh QUEUED (pod_id=None) record for the same
+    run_id, so the next relaunch() call retries it -- same run_id, so
+    --resume still applies if anything was ever checkpointed (nothing will
+    have been, for a pod that never booted). Returns the run_ids requeued.
+    """
+    if client is None:
+        import runpod as client
+
+    now = time.time()
+    requeued = []
+    for run_id, rec in latest_state_by_run_id(state_path).items():
+        if not rec.get("pod_id"):
+            continue
+        age = now - rec.get("created_at", now)
+        if age < boot_grace_seconds:
+            continue
+        try:
+            pod = client.get_pod(rec["pod_id"])
+        except Exception:  # noqa: BLE001 - already gone counts as not booted
+            pod = None
+        if _has_booted(pod):
+            continue
+        try:
+            client.terminate_pod(rec["pod_id"])
+        except Exception:  # noqa: BLE001, S110 - best effort; it may already be gone
+            pass
+        requeue_rec = PodRecord(**{**rec, "pod_id": None, "created_at": time.time()})
+        append_state(requeue_rec, state_path)
+        requeued.append(run_id)
+    return requeued
+
+
 # -- reap ---------------------------------------------------------------
 
 
@@ -666,6 +728,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("watchdog")
 
+    p_boots = sub.add_parser("reap-stuck-boots")
+    p_boots.add_argument("--boot-grace-seconds", type=int, default=600)
+
     p_reap = sub.add_parser("reap")
     p_reap.add_argument("--prefix", required=True)
 
@@ -717,6 +782,9 @@ def _dispatch(args: argparse.Namespace) -> int:
     elif args.cmd == "watchdog":
         t = watchdog()
         print(f"terminated {len(t)} pods over 1.5x their wall-clock limit")
+    elif args.cmd == "reap-stuck-boots":
+        r = reap_stuck_boots(boot_grace_seconds=args.boot_grace_seconds)
+        print(f"requeued {len(r)} pods that never booted: {r}")
     elif args.cmd == "reap":
         r = reap(args.prefix)
         print(f"matched {r['matched']} pods, terminated {len(r['terminated'])}")
