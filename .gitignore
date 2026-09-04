@@ -16,3 +16,6 @@ __pycache__/
 # The dependency pin for docker/Dockerfile (RUNPOD.md section 2), which COPYs
 # it; the monorepo root .gitignore excludes uv.lock as an upstream C++ rule.
 !uv.lock
+
+# Claude Code harness state (agent worktree sandboxes etc.), not project content.
+.claude/

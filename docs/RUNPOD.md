@@ -142,8 +142,17 @@ Two tiers:
    and metadata. `S3_BUCKET` and credentials arrive through env vars.
 
 S3 is OPTIONAL and currently OFF: no bucket is configured for this project,
-so runs write only to local disk and `runpod_launch.py collect` pulls them
-over scp. Everything below is what happens once `S3_BUCKET` is set.
+so runs write only to the pod's local disk and `runpod_launch.py collect`
+pulls them back. Everything below is what happens once `S3_BUCKET` is set.
+
+`collect` does NOT use scp. A raw TCP connect to a live, healthy pod's mapped
+SSH port times out from the environment this launcher runs in, while outbound
+HTTPS works, so scp-based collection cannot work here at all. Instead every
+job starts `python3 -m http.server` over `/workspace/runs` before training,
+tars its finished run directory to `<run_id>.tar.gz`, and `collect` fetches
+that one file over RunPod's own HTTPS reverse proxy at
+`https://<pod_id>-<port>.proxy.runpod.net`. The same proxy serves `job.log`
+mid-run, which is how a running job is watched without a shell on the pod.
 
 Protocol (implemented in `bdhx/s3sync.py`, driven by
 `bdhx/training/trainer.py`, `tools/sync_checkpoint.py` and
@@ -272,7 +281,7 @@ Subcommands and behaviour:
 | `relaunch` | relaunches queued jobs (resume is automatic) |
 | `watchdog` | terminates any tracked pod whose uptime exceeds 1.5x its `MAX_SECONDS`; run as a loop or cron |
 | `reap --prefix bdhx-<sweep>` | lists all pods with the prefix and terminates them; called in a `finally` block of `launch` and manually after every sweep |
-| `collect <generated/sweep>` | downloads `runs/<run_id>/` results for every job into `results/` for `aggregate_results.py` |
+| `collect <generated/sweep>` | downloads `runs/<run_id>/` results for every job into `results/` for `aggregate_results.py`, over the HTTPS proxy (see section 3), not scp |
 
 Cost safety checklist enforced by the launcher:
 
@@ -408,6 +417,15 @@ Added 2026-09-03 by the first session with a connected MCP server:
 - ~~Prices via a third independent source.~~ VERIFIED through the RunPod MCP
   server's `list-gpu-types`: A5000 0.16/0.27 and 4090 0.34/0.74, matching the
   SDK and the pricing page exactly. See section 1.
+- The MCP server's credential is READ-ONLY for pods. `list-pods`,
+  `get-billing`, `list-gpu-types` and the GraphQL `myself` query all succeed,
+  but pod creation is refused with `Unauthorized` through all three of the MCP
+  server, `POST /v2/pods`, and the GraphQL `podFindAndDeployOnDemand`
+  mutation, on a funded account. Provisioning needs a Read-Write API key; a
+  session that only has the read key can still watch, cost-check and reap
+  through the proxy and the read endpoints, but cannot launch.
+- The `runpod` SDK does not escape `docker_args`. See section 5; the launcher
+  escapes it before calling `create_pod`.
 - NEW, and it changes the default: RTX A5000 stock is NONE on both clouds.
   Section 1 now carries a live availability table and the launcher default
   moved to RTX 4090 Community.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -74,10 +75,12 @@ class FakeRunpod:
         self.pods: dict[str, dict] = {}
         self._next_id = 0
         self.terminated: list[str] = []
+        self.last_create_kwargs: dict = {}
 
     def create_pod(self, **kwargs):
         self._next_id += 1
         pid = f"pod-{self._next_id}"
+        self.last_create_kwargs = kwargs
         self.pods[pid] = {
             "id": pid,
             "name": kwargs["name"],
@@ -182,6 +185,40 @@ def test_launch_dry_run_creates_no_pods(tmp_path):
     client = FakeRunpod()
     launch(d, git_ref="deadbeef", client=client, state_path=tmp_path / "state.jsonl", dry_run=True)
     assert len(client.pods) == 0
+
+
+def test_gql_escape_round_trips_through_naive_fstring_embedding():
+    """Mirrors exactly what the buggy SDK does: f'"{escaped}"' must parse as JSON/GraphQL."""
+    from tools.runpod_launch import _gql_escape
+
+    for raw in [
+        'has "quotes"',
+        "has\nnewlines\nand\ttabs",
+        "has\\backslashes\\",
+        "bash -lc 'echo \"hi\" && echo done'\nsleep 10",
+    ]:
+        escaped = _gql_escape(raw)
+        assert "\n" not in escaped  # GraphQL string literals cannot contain raw newlines
+        naive_embed = f'"{escaped}"'
+        assert json.loads(naive_embed) == raw
+
+
+def test_launch_passes_escaped_docker_args_to_create_pod(tmp_path):
+    """Regression test for the real bug this session found: the runpod SDK
+    embeds docker_args unescaped into its GraphQL mutation, so a multi-line
+    startup script with embedded quotes broke pod creation against the live
+    API ("Syntax Error: Unterminated string") until launch() started
+    escaping it first.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=tmp_path / "state.jsonl")
+    sent = client.last_create_kwargs["docker_args"]
+    decoded = json.loads(
+        f'"{sent}"'
+    )  # what the SDK's naive f'"{docker_args}"' effectively parses to
+    assert "bash -lc" in decoded and "pip install" in decoded
+    assert '"' in decoded  # the raw script does contain quotes -- that's what broke it unescaped
 
 
 def test_docker_args_never_contains_api_key():
@@ -326,18 +363,6 @@ def test_reap_empty_when_nothing_matches():
 # -- collect --------------------------------------------------------------
 
 
-def test_collect_skips_pods_with_no_reachable_ssh_port(tmp_path):
-    d = three_job_manifest(tmp_path)
-    client = FakeRunpod()
-    state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
-    client.pods[created[0].pod_id]["runtime"]["ports"] = []  # no ssh port exposed yet
-    result = collect(d, tmp_path / "out", state_path=state_path, client=client)
-    assert result["pulled"] == []
-    assert len(result["skipped"]) == 1
-    assert "ssh" in result["skipped"][0]["reason"]
-
-
 def test_collect_skips_missing_pods_without_crashing(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
@@ -347,6 +372,74 @@ def test_collect_skips_missing_pods_without_crashing(tmp_path):
     result = collect(d, tmp_path / "out", state_path=state_path, client=client)
     assert result["pulled"] == []
     assert result["skipped"][0]["run_id"] == created[0].run_id
+
+
+def test_collect_skips_when_fetch_fails(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+
+    def failing_fetch(url, dest):
+        return False
+
+    result = collect(d, tmp_path / "out", state_path=state_path, client=client, fetch=failing_fetch)
+    assert result["pulled"] == []
+    assert len(result["skipped"]) == 1
+    assert "fetch failed" in result["skipped"][0]["reason"]
+
+
+def test_collect_fetches_and_extracts_tarball(tmp_path):
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    run_id = created[0].run_id
+
+    def fake_fetch(url, dest):
+        assert url == f"https://{created[0].pod_id}-8888.proxy.runpod.net/{run_id}.tar.gz"
+        src = tmp_path / "src" / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text('{"exact_match": 1.0}')
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(src, arcname=run_id)
+        return True
+
+    out_dir = tmp_path / "out"
+    result = collect(d, out_dir, state_path=state_path, client=client, fetch=fake_fetch)
+    assert result["pulled"] == [run_id]
+    assert result["skipped"] == []
+    assert (out_dir / run_id / "results.json").read_text() == '{"exact_match": 1.0}'
+    assert not (out_dir / f"{run_id}.tar.gz").exists()  # tarball cleaned up
+
+
+def test_collect_terminate_on_collect_only_after_success(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+
+    def failing_fetch(url, dest):
+        return False
+
+    collect(
+        d,
+        tmp_path / "out",
+        state_path=state_path,
+        client=client,
+        fetch=failing_fetch,
+        terminate_on_collect=True,
+    )
+    assert created[0].pod_id in client.pods  # not terminated: nothing was collected
+
+
+def test_pod_proxy_url_format():
+    from tools.runpod_launch import pod_proxy_url
+
+    assert pod_proxy_url("abc123") == "https://abc123-8888.proxy.runpod.net"
+    assert pod_proxy_url("abc123", port=22) == "https://abc123-22.proxy.runpod.net"
 
 
 # -- manifest reader ------------------------------------------------------

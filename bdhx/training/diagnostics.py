@@ -61,7 +61,9 @@ def activation_stats(x: Tensor) -> tuple[float, list[float], int]:
         f = torch.nan_to_num(f)
         active = float((f.abs() > ACTIVE_EPS).float().mean())
         per_neuron = f.abs().reshape(-1, f.shape[-1]).mean(dim=0)
-        qs = torch.tensor([p / 100.0 for p in PERCENTILES], dtype=per_neuron.dtype)
+        qs = torch.tensor(
+            [p / 100.0 for p in PERCENTILES], dtype=per_neuron.dtype, device=per_neuron.device
+        )
         pcts = [float(v) for v in torch.quantile(per_neuron, qs)]
     return active, pcts, bad
 

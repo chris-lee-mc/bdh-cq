@@ -4,12 +4,22 @@ Every function that talks to RunPod takes a `client` argument (default: the
 real `runpod` module) so tests can pass a fake with the same attribute names
 (`create_pod`, `get_pod`, `get_pods`, `terminate_pod`, `api_key`).
 
+The launching environment cannot reach pods over raw TCP (SSH/scp): the
+sandbox this launcher was developed in only permits outbound HTTPS through a
+policy-enforcing proxy, and a bare `/dev/tcp` connect to a pod's mapped SSH
+port timed out even though the pod itself was healthy and its SSH daemon
+reachable from the open internet. If your environment CAN reach arbitrary
+TCP, scp would also work, but this launcher does not assume that.
+
 Default (no S3): jobs write to /workspace/runs/<run_id> on the pod's own disk
-and `collect` pulls it over SSH/scp before the pod is terminated. A job that
-is preempted before `collect` runs loses its progress beyond the last local
-checkpoint on that pod's disk -- there is no off-pod copy until collect runs.
-Say this plainly in any run report. This is still the default because no S3
-bucket is configured for this project.
+and also serve it over HTTP (`python3 -m http.server`, `ports=8888/http`).
+`collect` fetches `<run_id>.tar.gz` through RunPod's own HTTPS reverse proxy
+(`https://<pod_id>-8888.proxy.runpod.net/...`), which IS reachable from an
+HTTPS-only sandbox, before the pod is terminated. A job that is preempted
+before `collect` runs loses its progress beyond the last local checkpoint on
+that pod's disk -- there is no off-pod copy until collect runs. Say this
+plainly in any run report. This is still the default because no S3 bucket is
+configured for this project.
 
 Opt-in (`--s3-bucket`): the RUNPOD.md section 3 protocol is used instead, via
 `tools/fetch_latest_checkpoint.py` before training and
@@ -38,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -51,12 +62,19 @@ from bdhx.config import PROJECT_ROOT
 DEFAULT_STATE_FILE = PROJECT_ROOT / "runpod_state.jsonl"
 DEFAULT_RATES_FILE = PROJECT_ROOT / "configs" / "runpod_rates.yaml"
 DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2404"
-# RTX A5000 was the documented default but has been out of stock on both
-# Community and Secure since at least 2026-09-03; the 4090 is the cheapest
-# capable GPU with real stock. Override with --gpu-type.
+# The A5000 was the documented default, but list-gpu-types reported it at
+# zero availability on both Community and Secure on 2026-09-03, with no
+# CUDA version on offer. The 4090 is the cheapest capable GPU that had
+# stock and CUDA 12.8. Stock moves: re-check before a sweep, and override
+# with --gpu-type rather than editing this.
 DEFAULT_GPU_TYPE = "NVIDIA GeForce RTX 4090"
 DEFAULT_CLOUD_TYPE = "COMMUNITY"
 REPO_URL = "https://github.com/chris-lee-mc/bdh-cq"
+# Standalone repo: bdhx/, tools/, etc. live at the repo root, not nested
+# under a subdirectory the way this project used to sit inside a llama.cpp
+# fork. Kept as a constant (rather than deleted) so a future nested layout
+# only needs this set back to a subdir name.
+REPO_SUBDIR = ""
 
 RUNNING_STATUSES = {"RUNNING"}
 TERMINAL_STATUSES = {"EXITED", "TERMINATED"}
@@ -205,22 +223,42 @@ def latest_state_by_run_id(state_path: Path = DEFAULT_STATE_FILE) -> dict[str, d
 # -- launch -----------------------------------------------------------------
 
 
-def build_docker_args(cfg: PodRecord, git_ref: str, *, s3_bucket: str | None = None) -> str:
+DEFAULT_HTTP_PORT = 8888
+
+
+def build_docker_args(
+    cfg: PodRecord,
+    git_ref: str,
+    *,
+    s3_bucket: str | None = None,
+    http_port: int = DEFAULT_HTTP_PORT,
+) -> str:
     """Startup command for the stock runpod/pytorch image (no Dockerfile needed).
 
-    Deliberately does not embed RUNPOD_API_KEY or self-terminate: the account's
-    master key is not distributed to every pod. Termination is the launcher's
-    job (collect --terminate-on-collect, or watchdog/reap).
+    Deliberately does not embed RUNPOD_API_KEY: the account's master key is
+    not distributed to every pod. Termination is the launcher's job
+    (collect --terminate-on-collect, or watchdog/reap), not the pod's own.
 
-    `s3_bucket` is opt-in and off by default. Without it (the only mode in use
-    today, since no bucket is configured) the command is byte-for-byte what it
-    has always been: train to local disk, collect over scp. With it, the job
-    additionally follows the RUNPOD.md section 3 protocol -- fetch the run's
-    latest checkpoint before training, and sync every checkpoint off the pod
-    during it -- so a preemption costs at most the work since the last upload
-    instead of everything since the last `collect`. The credentials that go
-    with the bucket are passed through `create_pod(env=...)`, never baked in
-    here; see `s3_env`.
+    Starts `python3 -m http.server` on `http_port` over /workspace/runs
+    immediately (backgrounded), before anything else, so job.log is
+    fetchable mid-run through RunPod's HTTPS proxy
+    (https://<pod_id>-<http_port>.proxy.runpod.net/<run_id>/job.log) even
+    while training or the pip/git steps are still going. After the trainer
+    exits (success, failure, or its own `timeout`), the whole run directory
+    is tarred into <run_id>.tar.gz for `collect` to fetch as one file, and
+    the container sleeps rather than exiting so there is a window to collect
+    before termination -- termination is still always the launcher's job.
+
+    `s3_bucket` is opt-in and off by default. Without it (the only mode in
+    use today, since no bucket is configured) the command is byte-for-byte
+    what it has always been apart from the HTTP server: train to local disk,
+    collect over the HTTP proxy. With it, the job additionally follows the
+    RUNPOD.md section 3 protocol -- fetch the run's latest checkpoint before
+    training, and sync every checkpoint off the pod during it -- so a
+    preemption costs at most the work since the last upload instead of
+    everything since the last `collect`. The credentials that go with the
+    bucket are passed through `create_pod(env=...)`, never baked in here;
+    see `s3_env`.
     """
     out_dir = f"/workspace/runs/{cfg.run_id}"
     fetch = ""
@@ -235,9 +273,12 @@ def build_docker_args(cfg: PodRecord, git_ref: str, *, s3_bucket: str | None = N
         "bash -lc '"
         "set -uo pipefail; "
         f"mkdir -p {out_dir}; "
+        f"nohup python3 -m http.server {http_port} --directory /workspace/runs "
+        "> /workspace/http.log 2>&1 & "
         "cd /workspace; "
         f"if [ ! -d repo ]; then git clone --depth 200 {REPO_URL} repo; fi; "
         f"cd repo && git fetch origin {git_ref} && git checkout {git_ref} && "
+        f"{'cd ' + REPO_SUBDIR + ' && ' if REPO_SUBDIR else ''}"
         'pip install -q -e ".[gpu]" && '
         'pip install -q "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"; '
         f"{fetch}"
@@ -245,9 +286,26 @@ def build_docker_args(cfg: PodRecord, git_ref: str, *, s3_bucket: str | None = N
         f"--config {cfg.config_path} --run-id {cfg.run_id} --resume "
         f"{sync}"
         f"--out {out_dir} > {out_dir}/job.log 2>&1; "
-        f"echo $? > {out_dir}/EXIT_CODE"
+        f"echo $? > {out_dir}/EXIT_CODE; "
+        f"cd /workspace/runs && tar czf {cfg.run_id}.tar.gz {cfg.run_id}; "
+        "sleep 1800"
         "'"
     )
+
+
+def _gql_escape(s: str) -> str:
+    """Escape a string for the runpod SDK's GraphQL mutation builder.
+
+    `runpod.api.mutations.pods.generate_pod_deployment_mutation` embeds
+    string arguments straight into the mutation source with an f-string --
+    `f'dockerArgs: "{docker_args}"'` -- with no escaping at all. A multi-line
+    startup script (real newlines, embedded double quotes) breaks the
+    resulting GraphQL document ("Syntax Error: Unterminated string"),
+    confirmed against the live API. GraphQL string-literal escaping is the
+    same as JSON's, so `json.dumps` does the escaping; strip the quotes
+    `json.dumps` adds since the SDK's f-string supplies its own.
+    """
+    return json.dumps(s)[1:-1]
 
 
 # S3 settings the pod needs to reach the bucket. Read from the launcher's own
@@ -318,7 +376,7 @@ def launch(
             continue  # already launched (or queued) this run_id; use relaunch for retries
         name = f"bdhx-{sweep}-{job.exp}"
         rel = os.path.relpath(generated_dir, PROJECT_ROOT)
-        config_path = f"{rel}/{job.exp}.yaml"
+        config_path = f"{REPO_SUBDIR + '/' if REPO_SUBDIR else ''}{rel}/{job.exp}.yaml"
         rec = PodRecord(
             sweep=sweep,
             exp=job.exp,
@@ -342,8 +400,8 @@ def launch(
             cloud_type=cloud_type,
             gpu_count=1,
             container_disk_in_gb=20,
-            docker_args=docker_args,
-            ports="22/tcp",
+            docker_args=_gql_escape(docker_args),
+            ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
             env={
                 "RUN_ID": rec.run_id,
                 "MAX_SECONDS": str(max_seconds),
@@ -437,8 +495,8 @@ def relaunch(
             cloud_type=rec.cloud_type,
             gpu_count=1,
             container_disk_in_gb=20,
-            docker_args=docker_args,
-            ports="22/tcp",
+            docker_args=_gql_escape(docker_args),
+            ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
             env={
                 "RUN_ID": rec.run_id,
                 "MAX_SECONDS": str(rec.max_seconds),
@@ -490,11 +548,26 @@ def reap(prefix: str, client=None) -> dict:
 # -- collect --------------------------------------------------------------
 
 
-def pod_ssh_target(pod: dict) -> tuple[str, int] | None:
-    for port in (pod.get("runtime") or {}).get("ports", []) or []:
-        if port.get("privatePort") == 22 and port.get("isIpPublic"):
-            return port["ip"], int(port["publicPort"])
-    return None
+def pod_proxy_url(pod_id: str, port: int = DEFAULT_HTTP_PORT) -> str:
+    """RunPod's HTTPS reverse proxy for an exposed HTTP port on a pod.
+
+    Deterministic from pod_id and port -- no need to query the pod's own
+    runtime.ports mapping the way the old SSH path did. Verified reachable
+    from an HTTPS-only sandbox where a raw TCP connect to the pod's SSH port
+    timed out (see the module docstring).
+    """
+    return f"https://{pod_id}-{port}.proxy.runpod.net"
+
+
+def _http_fetch(url: str, dest: Path, timeout: int = 120) -> bool:
+    result = subprocess.run(
+        ["curl", "-fsS", "--max-time", str(timeout), "-o", str(dest), url],
+        capture_output=True,
+        text=True,
+        timeout=timeout + 10,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def collect(
@@ -503,8 +576,14 @@ def collect(
     state_path: Path = DEFAULT_STATE_FILE,
     client=None,
     terminate_on_collect: bool = False,
-    ssh_user: str = "root",
+    port: int = DEFAULT_HTTP_PORT,
+    fetch=_http_fetch,
 ) -> dict:
+    """Pull each job's <run_id>.tar.gz over the RunPod HTTP proxy and extract it.
+
+    `fetch(url, dest_path) -> bool` is injectable so tests can fake the
+    network call the same way `client` fakes the RunPod SDK.
+    """
     if client is None:
         import runpod as client
 
@@ -519,29 +598,22 @@ def collect(
             pod = client.get_pod(rec["pod_id"])
         except Exception:  # noqa: BLE001 - a not-found pod is just uncollectable
             pod = None
-        target = pod_ssh_target(pod) if pod else None
-        if target is None:
-            skipped.append({"run_id": run_id, "reason": "no reachable ssh port (pod gone?)"})
+        if pod is None:
+            skipped.append({"run_id": run_id, "reason": "pod not found (gone?)"})
             continue
-        ip, port = target
-        dest = out_dir / run_id
-        dest.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "scp",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=15",
-            "-P",
-            str(port),
-            "-r",
-            f"{ssh_user}@{ip}:/workspace/runs/{run_id}/*",
-            str(dest),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
-        if result.returncode != 0:
-            skipped.append({"run_id": run_id, "reason": result.stderr.strip()[-300:]})
+        url = f"{pod_proxy_url(rec['pod_id'], port)}/{run_id}.tar.gz"
+        tar_path = out_dir / f"{run_id}.tar.gz"
+        if not fetch(url, tar_path):
+            skipped.append({"run_id": run_id, "reason": f"fetch failed: {url}"})
             continue
+        try:
+            with tarfile.open(tar_path) as tf:
+                tf.extractall(out_dir, filter="data")
+        except tarfile.TarError as e:
+            skipped.append({"run_id": run_id, "reason": f"bad tarball: {e}"})
+            continue
+        finally:
+            tar_path.unlink(missing_ok=True)
         pulled.append(run_id)
         if terminate_on_collect:
             try:
