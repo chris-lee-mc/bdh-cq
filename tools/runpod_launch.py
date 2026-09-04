@@ -318,7 +318,21 @@ def build_docker_args(
         "> /workspace/http.log 2>&1 & "
         "cd /workspace; "
         f"if [ ! -d repo ]; then git clone --depth 200 {REPO_URL} repo; fi; "
-        f"cd repo && git fetch origin {git_ref} && git checkout {git_ref} && "
+        # `git checkout {git_ref}` (the ref's own name) only works when git_ref
+        # is a commit SHA (whose object is present after any fetch) or when a
+        # local/remote-tracking ref with that exact name already exists. A
+        # plain `git clone --depth N` defaults to --single-branch, so it never
+        # creates a tracking ref for any branch but the remote's default one;
+        # `git fetch origin <branch>` on its own only updates FETCH_HEAD, not
+        # refs/remotes/origin/<branch>. So passing a branch name here used to
+        # fail with "pathspec did not match any file(s)" on every fresh pod,
+        # which -- because this whole chain is `&&`-joined into one big
+        # semicolon-separated statement -- silently skipped straight past both
+        # pip installs to the training command, crashing every job with
+        # ModuleNotFoundError instead of a git error. FETCH_HEAD always
+        # resolves after `git fetch origin <ref>`, whether ref is a branch,
+        # tag, or SHA.
+        f"cd repo && git fetch origin {git_ref} && git checkout FETCH_HEAD && "
         f"{'cd ' + REPO_SUBDIR + ' && ' if REPO_SUBDIR else ''}"
         'pip install -q -e ".[gpu]" && '
         'pip install -q "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"; '

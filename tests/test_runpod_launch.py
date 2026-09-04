@@ -309,6 +309,35 @@ def test_docker_args_never_contains_api_key():
     assert "h0_s1" in args and "cfg.yaml" in args
 
 
+def test_docker_args_checks_out_fetch_head_not_the_literal_git_ref():
+    """Regression test: found live on the real A1 sweep. `git clone --depth N`
+    defaults to --single-branch, so a fresh pod clone never has a
+    remote-tracking ref for anything but the repo's default branch; a plain
+    `git fetch origin <branch>` only updates FETCH_HEAD, not
+    refs/remotes/origin/<branch>. So `git checkout {git_ref}` failed with
+    "pathspec ... did not match any file(s)" for every branch-name git_ref
+    (a raw commit SHA happened to work, since the object is present after any
+    fetch) -- and because the whole git+pip chain is one big semicolon-joined
+    statement, that failure was swallowed and every job crashed instead with
+    ModuleNotFoundError on the very first import in run_experiment.py.
+    """
+    from tools.runpod_launch import PodRecord
+
+    rec = PodRecord(
+        sweep="s",
+        exp="exp_000",
+        run_id="h0_s1",
+        pod_id=None,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=100,
+        config_path="cfg.yaml",
+    )
+    args = build_docker_args(rec, "claude/some-branch-name")
+    assert "git fetch origin claude/some-branch-name && git checkout FETCH_HEAD" in args
+    assert "git checkout claude/some-branch-name" not in args
+
+
 def test_docker_args_regenerates_the_sweep_when_sweep_config_path_is_set():
     """Regression test: generated/ is gitignored, so a pod's fresh clone
     never has cfg.config_path on disk. Found live: the first real sweep job
