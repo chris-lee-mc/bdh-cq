@@ -190,6 +190,57 @@ def test_launch_dry_run_creates_no_pods(tmp_path):
     assert len(client.pods) == 0
 
 
+def test_launch_survives_one_create_pod_failure_and_queues_it(tmp_path):
+    """Regression test: a single provisioning failure (e.g. transient GPU
+    capacity contention, hit repeatedly against the live API this session)
+    used to crash launch() entirely, losing every job after it in the batch.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    calls = {"n": 0}
+    real_create_pod = client.create_pod
+
+    def flaky_create_pod(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("There are no longer any instances available")
+        return real_create_pod(**kwargs)
+
+    client.create_pod = flaky_create_pod
+    created = launch(
+        d, git_ref="x", max_concurrent=2, client=client, state_path=tmp_path / "state.jsonl"
+    )
+    assert len(created) == 3  # all 3 jobs accounted for, none dropped
+    launched = [r for r in created if r.pod_id]
+    queued = [r for r in created if not r.pod_id]
+    assert len(launched) == 2  # 2nd and 3rd create_pod calls succeeded
+    assert len(queued) == 1  # 1st call failed -- queued for relaunch, not lost
+
+
+def test_relaunch_survives_one_create_pod_failure(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(d, git_ref="x", max_concurrent=0, client=client, state_path=state_path, dry_run=True)
+
+    calls = {"n": 0}
+    real_create_pod = client.create_pod
+
+    def flaky_create_pod(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("no instances available")
+        return real_create_pod(**kwargs)
+
+    client.create_pod = flaky_create_pod
+    relaunched = relaunch(d, git_ref="x", max_concurrent=2, state_path=state_path, client=client)
+    assert len(relaunched) == 1  # first attempt failed and was skipped, not raised
+    rows = status(state_path, client=client)
+    states = {r["run_id"]: r["state"] for r in rows}
+    assert list(states.values()).count("RUNNING") == 1
+    assert list(states.values()).count("QUEUED") == 2  # the failed one stays retryable
+
+
 def test_gql_escape_round_trips_through_naive_fstring_embedding():
     """Mirrors exactly what the buggy SDK does: f'"{escaped}"' must parse as JSON/GraphQL."""
     from tools.runpod_launch import _gql_escape

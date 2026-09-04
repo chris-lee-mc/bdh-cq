@@ -395,6 +395,8 @@ def launch(
     max_seconds = max_wall_clock_minutes * 60
 
     created: list[PodRecord] = []
+    failed: list[tuple[str, str]] = []
+    launched_this_call = 0
     for job in jobs:
         if job.run_id in existing and existing[job.run_id].get("pod_id"):
             continue  # already launched (or queued) this run_id; use relaunch for retries
@@ -412,29 +414,44 @@ def launch(
             config_path=config_path,
             name=name,
         )
-        if len(created) >= slots or dry_run:
+        if launched_this_call >= slots or dry_run:
             append_state(rec, state_path)  # QUEUED: no pod_id yet
             created.append(rec)
             continue
         docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
-        pod = client.create_pod(
-            name=name,
-            image_name=image,
-            gpu_type_id=gpu_type,
-            cloud_type=cloud_type,
-            gpu_count=1,
-            container_disk_in_gb=20,
-            docker_args=_gql_escape(docker_args),
-            ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
-            env={
-                "RUN_ID": rec.run_id,
-                "MAX_SECONDS": str(max_seconds),
-                **s3_env(s3_bucket),
-            },
-        )
+        try:
+            pod = client.create_pod(
+                name=name,
+                image_name=image,
+                gpu_type_id=gpu_type,
+                cloud_type=cloud_type,
+                gpu_count=1,
+                container_disk_in_gb=20,
+                docker_args=_gql_escape(docker_args),
+                ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
+                env={
+                    "RUN_ID": rec.run_id,
+                    "MAX_SECONDS": str(max_seconds),
+                    **s3_env(s3_bucket),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - one job's provisioning failure must not sink the batch
+            # Queued, not dropped: relaunch() retries it (e.g. transient GPU
+            # capacity contention -- observed repeatedly during this
+            # project's own verification). Reported via `failed`, not raised,
+            # so the rest of the sweep still launches.
+            append_state(rec, state_path)
+            created.append(rec)
+            failed.append((job.run_id, str(e)))
+            continue
         rec.pod_id = pod["id"] if isinstance(pod, dict) else pod
         append_state(rec, state_path)  # cost-safety rule: append BEFORE moving on
         created.append(rec)
+        launched_this_call += 1
+    if failed:
+        print(f"WARNING: {len(failed)} job(s) failed to provision, queued for relaunch:")
+        for run_id, msg in failed:
+            print(f"  {run_id}: {msg}")
     return created
 
 
@@ -512,21 +529,27 @@ def relaunch(
             name=r.get("name", f"bdhx-{r['sweep']}-{r['exp']}"),
         )
         docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
-        pod = client.create_pod(
-            name=rec.name,
-            image_name=image,
-            gpu_type_id=rec.gpu_type,
-            cloud_type=rec.cloud_type,
-            gpu_count=1,
-            container_disk_in_gb=20,
-            docker_args=_gql_escape(docker_args),
-            ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
-            env={
-                "RUN_ID": rec.run_id,
-                "MAX_SECONDS": str(rec.max_seconds),
-                **s3_env(s3_bucket),
-            },
-        )
+        try:
+            pod = client.create_pod(
+                name=rec.name,
+                image_name=image,
+                gpu_type_id=rec.gpu_type,
+                cloud_type=rec.cloud_type,
+                gpu_count=1,
+                container_disk_in_gb=20,
+                docker_args=_gql_escape(docker_args),
+                ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
+                env={
+                    "RUN_ID": rec.run_id,
+                    "MAX_SECONDS": str(rec.max_seconds),
+                    **s3_env(s3_bucket),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - one job's failure must not sink the batch
+            # Left as-is (QUEUED/MISSING in the state history already); the
+            # next relaunch() call retries it.
+            print(f"WARNING: relaunch of {rec.run_id} failed, will retry next call: {e}")
+            continue
         rec.pod_id = pod["id"] if isinstance(pod, dict) else pod
         append_state(rec, state_path)
         relaunched.append(rec)
