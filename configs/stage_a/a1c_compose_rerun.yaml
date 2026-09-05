@@ -1,0 +1,43 @@
+# Stage A, experiment A1c: A1's compose arm, re-run on the fixed generator.
+#
+# A1's compose numbers are withdrawn (RESULTS.md section A1a): the generator
+# demonstrated each bijection on 4 draws WITH replacement from a domain of 8
+# and drew the query independently, so the answer was derivable in 0.41 of
+# depth-1 episodes and 0.001 of depth-8 ones, and in the rest it was a symbol
+# absent from the episode entirely.  Bayes-optimal exact match was 0.316 on
+# interp, 0.100 on mild and 0.031 on strong -- the last below this project's
+# own 0.05 credibility bar, so no result on compose could have counted.
+#
+# Everything here is identical to a1_first_experiment except the task
+# generator, so the two are directly comparable and the difference is
+# attributable to the fix alone.  Gate before launching:
+#   python tools/task_ceiling.py --task compose --min-train-solvable 0.99
+sweep:
+  name: a1c_compose_rerun
+  stage: A
+  description: >
+    A1's three arms on compose with every episode solvable from its own
+    demonstrations; asks whether looped_transformer's 3/3 AT_CHANCE was the
+    architecture or the corpus.
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, bdh_cq, looped_transformer]
+  task.name: [compose]
+seeds: [1, 2, 3]
+overrides:
+  model.params_target: 10_000_000
+  model.recurrence.kind: plain
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 40000
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+  evaluation.diagnostics: true
+notes: >
+  Results carry generator_version 0.2.0 and must never be merged into one
+  plot with A1's compose rows, which carry 0.1.0.  ComposeTask(
+  guarantee_solvable=False) reproduces the old distribution if the two ever
+  need to be run side by side as an explicit arm.

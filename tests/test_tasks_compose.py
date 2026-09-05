@@ -182,6 +182,61 @@ def test_target_correctness_compose():
                 assert found
 
 
+# -- test_solvable_from_demonstrations ---------------------------------------
+#
+# `test_target_correctness_compose` above checks the target against the hidden
+# bijections in `extras`, which no model sees.  These check the property a model
+# actually needs: that the answer can be derived from the demonstrations.
+
+
+def _chain_from_demonstrations(episode):
+    """Walk the query forward through the demonstrated pairs; None if it breaks."""
+    demo = {int(inp[0]): int(out[0]) for inp, out in episode.demonstrations}
+    cur = int(episode.query[-1])
+    for _ in range(int(episode.difficulty["depth"])):
+        if cur not in demo:
+            return None
+        cur = demo[cur]
+    return cur
+
+
+def test_compose_every_episode_is_solvable_from_its_demonstrations():
+    task = ComposeTask()
+    rng = np.random.default_rng(17)
+    for diff in _all_difficulties(task):
+        for _ in range(50):
+            ep = task.sample(rng, diff)
+            assert _chain_from_demonstrations(ep) == int(ep.target[0]), diff
+
+
+def test_compose_demonstrations_are_distinct_per_function():
+    """Sampling without replacement: no function wastes a demonstration on a repeat."""
+    task = ComposeTask()
+    rng = np.random.default_rng(19)
+    for depth in (1, 2, 4, 8):
+        ep = task.sample(rng, {"depth": depth})
+        inputs = [int(inp[0]) for inp, _ in ep.demonstrations]
+        assert len(inputs) == len(set(inputs))
+        assert len(inputs) == depth * task.n_examples_per_fn
+
+
+def test_compose_legacy_distribution_is_mostly_unsolvable():
+    """The pre-fix generator, kept behind a flag, and why the flag defaults to on."""
+    task = ComposeTask(guarantee_solvable=False)
+    rng = np.random.default_rng(23)
+    solved = sum(
+        _chain_from_demonstrations(task.sample(rng, {"depth": 2})) is not None for _ in range(500)
+    )
+    assert solved / 500 < 0.3  # analytic value at depth 2 is 0.171
+
+
+def test_compose_n_examples_never_exceeds_the_domain():
+    task = ComposeTask(n_examples_per_fn=32, domain_size=8)
+    rng = np.random.default_rng(29)
+    ep = task.sample(rng, {"depth": 2})
+    assert len(ep.demonstrations) == 2 * 8
+
+
 def _brute_order(items, x, y):
     idx = {int(v): i for i, v in enumerate(items)}
     return LT if idx[x] < idx[y] else GT

@@ -26,7 +26,9 @@ from bdhx.registry import get_task
 from bdhx.seeding import episode_id, task_rng
 from bdhx.tasks.base import Episode, EpisodicTask
 
-GENERATOR_VERSION = "0.1.0"
+# 0.2.0: `compose` guarantees every episode is solvable from its own
+# demonstrations and draws them without replacement (RESULTS.md section A1).
+GENERATOR_VERSION = "0.2.0"
 
 
 def _git_commit() -> str:
