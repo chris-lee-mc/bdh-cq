@@ -101,6 +101,33 @@ def at_chance(final_loss: float | None, task_name: str, tol: float = AT_CHANCE_T
     return abs(final_loss - reference) <= tol * reference
 
 
+def _dedupe_evaluations(evaluations: list) -> list:
+    """Keep only the last evaluation row per (step, reasoning_steps, split,
+    difficulty) within a single run.
+
+    Found live on the real A1 sweep: a job whose pod got relaunched *after*
+    it had already reached its final step (checkpoint intact, nothing left
+    to train) still re-runs run_experiment.py's unconditional final
+    `run_evaluation()` call once resumed. That call appends a fresh row for
+    the same (step, reasoning_steps, split, difficulty) on top of the
+    evaluations already carried over from the previous attempt's
+    results.json, so a single run_id can end up with the same cell recorded
+    2-3x over. build_summary() groups by that key across runs without
+    deduping first, so every duplicate silently counted as an independent
+    seed -- e.g. a 3-seed sweep cell read back with `n_seeds` in the 30s.
+    """
+    seen: dict[tuple, int] = {}
+    deduped: list = []
+    for row in evaluations:
+        key = (row.step, row.reasoning_steps, row.split, _difficulty_key(row.difficulty))
+        if key in seen:
+            deduped[seen[key]] = row
+        else:
+            seen[key] = len(deduped)
+            deduped.append(row)
+    return deduped
+
+
 def walk_runs(results_root: str | Path) -> list[RunRecord]:
     """Load every `results/<run>/results.json` under `results_root`."""
     root = Path(results_root)
@@ -111,6 +138,7 @@ def walk_runs(results_root: str | Path) -> list[RunRecord]:
         run_dir = results_path.parent
         try:
             results = ResultsWriter.load(run_dir)
+            results.evaluations = _dedupe_evaluations(results.evaluations)
         except Exception as exc:  # noqa: BLE001 - keep aggregating other runs
             records.append(
                 RunRecord(run_dir, ResultsFile.model_construct(), None, [f"unreadable: {exc}"])

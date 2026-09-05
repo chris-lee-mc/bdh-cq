@@ -146,6 +146,48 @@ def test_summary_stats_and_bootstrap_ci(two_group_results, tmp_path):
     assert lo <= mean <= hi
 
 
+def test_walk_runs_dedupes_pre_existing_duplicate_evaluation_rows(tmp_path):
+    """Regression test: found live on the real A1 sweep. Several run_ids'
+    results.json (written before ResultsWriter.flush() deduped on write)
+    already have 2-3 rows for the same (step, reasoning_steps, split,
+    difficulty) cell, from being relaunched after they had already reached
+    their final step. build_summary() groups across runs by that exact key
+    without deduping within a run first, so every duplicate silently counted
+    as an extra seed -- a 3-seed sweep cell read back with n_seeds in the
+    30s. walk_runs() must dedupe on load so aggregation stays correct
+    regardless of how the file on disk got that way.
+    """
+    root = tmp_path / "results"
+    root.mkdir()
+    run_dir = _write_run(
+        root,
+        "run_s1",
+        config_hash="hashE",
+        seed=1,
+        model="modelE",
+        task="toytask4",
+        params=100_000,
+        exact_match=0.5,
+    )
+    data = json.loads((run_dir / "results.json").read_text())
+    duplicate = dict(data["evaluations"][0])
+    duplicate["exact_match"] = 0.9  # a distinct value so we can tell which one survives
+    data["evaluations"].append(duplicate)
+    (run_dir / "results.json").write_text(json.dumps(data))
+
+    records = walk_runs(root)
+    assert len(records) == 1
+    assert len(records[0].results.evaluations) == 1
+    assert records[0].results.evaluations[0].exact_match == 0.9  # the later duplicate wins
+
+    out_dir = tmp_path / "report"
+    result = aggregate(root, out_dir)
+    with open(result["summary"]) as f:
+        rows = list(csv.DictReader(f))
+    row = next(r for r in rows if r["config_hash"] == "hashE")
+    assert row["n_seeds"] == "1"  # not 2, despite the duplicate row on disk
+
+
 def test_diverged_run_flagged_and_counted_as_zero(tmp_path):
     root = tmp_path / "results"
     root.mkdir()
