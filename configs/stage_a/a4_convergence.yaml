@@ -1,0 +1,68 @@
+# Stage A, experiment A4: does anything make BDH-CQ's latent loop converge?
+#
+# A narrowed slice of configs/stage_c/c1_recurrence_engineering.yaml, pulled
+# forward because RESULTS.md section A1b measured the thing C1 was going to
+# guess at.  On propagate, `cos(H[R], H[R-1])` at the last iteration reaches
+# 1.0000 for looped_transformer by R=32 and peaks at 0.79-0.95 for bdh_cq
+# before FALLING to 0.74-0.80 -- BDH-CQ's loop never settles, and its accuracy
+# past R_train_max falls with the rotation.  H7 (EXPERIMENT_PLAN section 3)
+# predicts an initial-state skip fixes that.
+#
+# The primary metric here is `cos_last` at R=32 from
+# recurrence_convergence_propagate.csv, NOT accuracy: it is the direct
+# measurement of the mechanism, it needs no bootstrap over a near-zero exact
+# match, and it is what tells a fixed point apart from a model that has given
+# up (bdh_cq on `strong` converges precisely because it has).  Accuracy at
+# R_test in {4, 8, 32} is the secondary metric.
+#
+# Kinds, and why these three:
+#   attn_residual  the community mechanism, whose author states it stabilizes
+#                  recurrence beyond 4 steps.  Adds no framework parameters.
+#   init_skip      H7 itself: gated injection of H[0] at every step.
+#   residual       h + block(h), the cheapest way to pull the map toward the
+#                  identity; the control that says whether init_skip's gain
+#                  needs the seed specifically or just a smaller step.
+#
+# `plain` is deliberately NOT in the grid: A1's three bdh_cq/propagate seeds
+# already ARE that cell.  Every field below matches a1_first_experiment.yaml
+# except `model.recurrence.kind`, and propagate's generator is unchanged at
+# version 0.2.0, so those runs are the reference arm and 3 jobs of GPU time do
+# not need spending twice.  Re-run them only if this file diverges from A1.
+sweep:
+  name: a4_convergence
+  stage: A
+  description: >
+    bdh_cq on propagate with three recurrence update rules against A1's plain
+    arm; does any of them reach a fixed point, and does accuracy past
+    R_train_max follow?
+base: configs/base/default.yaml
+grid:
+  model.recurrence.kind: [attn_residual, init_skip, residual]
+  task.name: [propagate]
+seeds: [1, 2, 3]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 40000
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+  evaluation.diagnostics: true
+controls:
+  # init_skip and residual add at most one width-sized gate vector -- about
+  # 0.03 percent of a 10M budget, an order of magnitude inside the 5 percent
+  # matching tolerance of EXPERIMENT_PLAN section 8 -- and the width solver
+  # already absorbs them.  A matched control would cost 3 more jobs to
+  # equalize a difference smaller than the seed spread.  C1 keeps them for
+  # the kinds that really do add parameters (step_emb, adapter).
+  matched_controls: false
+notes: >
+  R_train stays at {1, 2, 4} on purpose: this sweep must be comparable to A1
+  cell for cell, and changing what the model trains on at the same time as
+  the update rule would confound the two.  A2's curriculum is the separate
+  variable and should be run after this, as the control that shows whether
+  moving the trained R moves `cos_last` at all.

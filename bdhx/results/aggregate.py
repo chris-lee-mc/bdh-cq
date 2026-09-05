@@ -477,6 +477,90 @@ def build_flags(records: list[RunRecord], summary: list[dict[str, Any]]) -> list
 FLAGS_COLUMNS = ("flag", "config_hash", "model", "task", "detail")
 
 
+# -- recurrence convergence ---------------------------------------------------
+
+CONVERGENCE_COLUMNS = (
+    "model",
+    "task",
+    "split",
+    "difficulty",
+    "reasoning_steps",
+    "n_seeds",
+    "cos_last",
+    "cos_min_after_first",
+    "token_acc",
+    "exact_match",
+)
+
+
+def mean(values) -> float:
+    values = list(values)
+    return sum(values) / len(values) if values else float("nan")
+
+
+def convergence_rows(records: list[RunRecord], task: str) -> list[dict[str, Any]]:
+    """Per (model, split, difficulty, R_test): does the latent settle, and does it score?
+
+    `cos_last` is `cos(H[R], H[R-1])` at the final iteration: 1.0 means the loop
+    reached a fixed point, and a value that stops rising (or falls) as R grows
+    means it never will. Reported next to accuracy at the same R so that the two
+    can be read together, which is the comparison `EXPERIMENT_PLAN` section 6
+    asks for and the pooled per-iteration plots cannot support.
+    """
+    cells: dict[tuple, list[dict[str, float]]] = {}
+    final_step = max(
+        (ev.step for rec in records if rec.results.task == task for ev in rec.results.evaluations),
+        default=0,
+    )
+    for rec in records:
+        if rec.results.task != task:
+            continue
+        for ev in rec.results.evaluations:
+            if ev.step != final_step or ev.diagnostics is None:
+                continue
+            cos = ev.diagnostics.cos_consecutive
+            if not cos:
+                continue
+            key = (
+                rec.results.model,
+                ev.split,
+                _difficulty_key(ev.difficulty),
+                ev.reasoning_steps,
+            )
+            cells.setdefault(key, []).append(
+                {
+                    "cos_last": cos[-1],
+                    # Iteration 0 compares against the ingested seed, not against
+                    # a previous latent, so it is excluded from the minimum.
+                    "cos_min_after_first": min(cos[1:]) if len(cos) > 1 else cos[-1],
+                    "token_acc": ev.token_acc,
+                    "exact_match": ev.exact_match,
+                }
+            )
+    rows = []
+    for (model, split, difficulty, r), seeds in sorted(cells.items()):
+        rows.append(
+            {
+                "model": model,
+                "task": task,
+                "split": split,
+                "difficulty": difficulty,
+                "reasoning_steps": r,
+                "n_seeds": len(seeds),
+                **{
+                    field_name: mean(s[field_name] for s in seeds)
+                    for field_name in (
+                        "cos_last",
+                        "cos_min_after_first",
+                        "token_acc",
+                        "exact_match",
+                    )
+                },
+            }
+        )
+    return rows
+
+
 # -- plots ------------------------------------------------------------------
 
 
@@ -675,34 +759,80 @@ def make_plots(
         _empty_plot(path, "state_norm vs iteration")
         paths.append(path)
     for model, task in model_task_pairs:
-        series_by_diag = {name: [] for name in diag_names}
+        # Each series is labelled with the cell it came from. Unlabelled series
+        # pooled every checkpoint, split, difficulty and R_test into one picture,
+        # which is how the A1 write-up first read a converging curve off cells
+        # that do not converge (`RESULTS.md` section A1).
+        series_by_diag: dict[str, list[tuple[dict, list[float]]]] = {n: [] for n in diag_names}
         for rec in usable:
             if rec.results.model != model or rec.results.task != task:
                 continue
             for ev in rec.results.evaluations:
                 if ev.diagnostics is None:
                     continue
+                label = {
+                    "seed": rec.results.seed,
+                    "step": ev.step,
+                    "reasoning_steps": ev.reasoning_steps,
+                    "split": ev.split,
+                    "difficulty": _difficulty_key(ev.difficulty),
+                }
                 for name in diag_names:
                     values = getattr(ev.diagnostics, name)
                     if values:
-                        series_by_diag[name].append(values)
+                        series_by_diag[name].append((label, values))
+        final_step = max(
+            (label["step"] for series in series_by_diag.values() for label, _ in series),
+            default=0,
+        )
         for name in diag_names:
             fname = f"{name}_vs_iteration_{model}_{task}.png"
             path = out_dir / fname
             series = series_by_diag[name]
-            if not series:
+            plotted = [(lab, v) for lab, v in series if lab["step"] == final_step]
+            if not plotted:
                 _empty_plot(path, f"{name} vs iteration ({model}/{task})")
             else:
                 fig, ax = plt.subplots()
-                for i, vals in enumerate(series):
+                for i, (_, vals) in enumerate(plotted):
                     ax.plot(range(len(vals)), vals, alpha=0.6, label=None if i else name)
                 ax.set_xlabel("iteration")
                 ax.set_ylabel(name)
-                ax.set_title(f"{name} vs iteration ({model}/{task})")
+                ax.set_title(f"{name} vs iteration ({model}/{task}, step {final_step})")
                 _save(fig, path)
-            rows = [{"iteration": i, name: v} for vals in series for i, v in enumerate(vals)]
+            rows = [
+                {**label, "iteration": i, name: v}
+                for label, vals in series
+                for i, v in enumerate(vals)
+            ]
             write_csv(rows or [{}], out_dir / f"{name}_vs_iteration_{model}_{task}.csv")
             paths.append(path)
+
+    # 7. recurrence_convergence_<task>.png: does the latent reach a fixed point?
+    for task in tasks:
+        path = out_dir / f"recurrence_convergence_{task}.png"
+        rows = convergence_rows(usable, task)
+        if not rows:
+            _empty_plot(path, f"recurrence convergence ({task})")
+        else:
+            fig, ax = plt.subplots()
+            by_model: dict[str, list] = {}
+            for r in rows:
+                by_model.setdefault(r["model"], []).append(r)
+            for name, pts in sorted(by_model.items()):
+                merged: dict[int, list[float]] = {}
+                for p in pts:
+                    merged.setdefault(p["reasoning_steps"], []).append(p["cos_last"])
+                xs = sorted(merged)
+                ax.plot(xs, [mean(merged[x]) for x in xs], marker="o", label=name)
+            ax.set_xscale("log", base=2)
+            ax.set_xlabel("R_test")
+            ax.set_ylabel("cos(H[R], H[R-1]) at the last iteration")
+            ax.set_title(f"recurrence convergence ({task}); 1.0 = fixed point")
+            ax.legend(fontsize="small")
+            _save(fig, path)
+        write_csv(rows or [{}], out_dir / f"recurrence_convergence_{task}.csv", CONVERGENCE_COLUMNS)
+        paths.append(path)
 
     return paths
 

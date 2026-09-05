@@ -37,17 +37,24 @@ Gate A finding: **yes, conditionally.** BDH-CQ (community) at R_test =
 R_train_max = 4 produces a large, credible improvement over the matched
 fixed-depth baseline on the `propagate` task's `mild` extrapolation split
 (0.579 vs 0.017 exact match, non-overlapping 95 percent CIs, gap far past the
-0.05 threshold). The same model collapses to exact match 0.000 the moment
-R_test exceeds R_train_max (R=8, 16, 32), so this is not test-time compute
-scaling (Gate D fails outright for BDH-CQ) -- it is a real but narrow win
-that only holds exactly at the trained R. No model shows a credible
-improvement on `compose`, where BDH-CQ and the looped Transformer mostly sit
-at or below the non-recurrent baseline (`looped_transformer` never left the
-loss chance plateau on `compose` in any seed). See A1 below for the full
-breakdown. The Gate A *diagnosis* of `EXPERIMENT_PLAN` section 10 was also
-carried out ahead of the sweep because the CPU dev runs were flat at chance;
-see section A0 for the three framework defects it found and the two
-model-scale limits it did not.
+0.05 threshold). Past R_train_max the same model falls apart: exact match is
+0.000 at R = 8, 16 and 32, so Gate D fails outright for BDH-CQ. See A1 below
+for the full breakdown, and A1a/A1b for the two follow-up diagnoses that
+say *why* each half of that sentence happened. `compose` is excluded from the
+Gate A comparison entirely: section A1a shows its generator made 71 percent of
+training episodes unanswerable, capping Bayes-optimal exact match at 0.10 on
+`mild` and 0.03 on `strong`, so no model on `compose` could have cleared the
+0.05 credibility bar whatever it learned.
+
+Two claims in the first version of this section were wrong and are corrected
+below: the fall past R_train_max is *graded*, not a discontinuous collapse
+(exact match over a 12-token target hides a token accuracy that falls 0.95 ->
+0.60 -> 0.46, section A1b), and it is *not* a readout failure over a
+well-behaved state -- BDH-CQ's latent loop never reaches a fixed point at all,
+while the looped Transformer's does (section A1b). The Gate A *diagnosis* of
+`EXPERIMENT_PLAN` section 10 was also carried out ahead of the sweep because
+the CPU dev runs were flat at chance; see section A0 for the three framework
+defects it found and the two model-scale limits it did not.
 
 ### A0. CPU pipeline validation (dev, not evidence)
 
@@ -347,20 +354,24 @@ Worth a `[1,2,3,4,5]`-seed repeat before it is called a finding either way.
 **Diagnostics and stability** (`state_norm`, `cos_consecutive`,
 `update_norm` vs iteration; full plots in `reports/a1_first_experiment/`):
 
-- `bdh_cq`'s hidden state does not blow up or decay past R_train_max: state
+- ~~`bdh_cq`'s hidden state does not blow up or decay past R_train_max: state
   norm on `propagate` is flat at ~25.14 from iteration 3 through 32, and
   `cos_consecutive` reaches ~0.95-1.0 by iteration ~3 and stays there. The
-  0.579 to 0.000 collapse from R=4 to R=8 is therefore not a numerical
-  instability -- the recurrent state itself is well-behaved and near a fixed
-  point at every R tested. This looks like the same total, discontinuous
-  "overthinking" collapse the A0 section already reported at 1.5M
-  parameters, now confirmed at 10M and with real seeds: the readout has
-  learned to work with states from R in {1,2,4} specifically, not with
-  "however many iterations the state has been through."
-- `looped_transformer`'s convergence is smoother and reaches
-  `cos_consecutive` ~1.0 faster with less seed-to-seed noise than `bdh_cq`'s,
-  consistent with its own accuracy degrading gradually (1.000 to 0.466 from
+  recurrent state is well-behaved and near a fixed point at every R tested,
+  so the collapse is a readout generalization failure.~~ **Both halves of
+  this were wrong; see A1b.** The flat state norm is an artifact: the
+  community BDH ends every block with a parameter-free LayerNorm, so
+  `||H||` is pinned at sqrt(dim) by construction and cannot diagnose
+  anything. And the `cos_consecutive` reading came from
+  `cos_consecutive_vs_iteration_bdh_cq_propagate.png`, which at the time
+  pooled every checkpoint, split, difficulty and R_test into one unlabelled
+  overlay; the converging curves in it belong to cells where the model had
+  already given up. On the cells that carry the Gate A result,
+  `cos_consecutive` peaks at 0.79-0.95 and then *falls* as R grows.
+- `looped_transformer`'s accuracy degrades gradually (1.000 to 0.466 from
   R=4 to R=32 on `propagate`/interp) rather than collapsing outright.
+  Section A1b ties that to the difference that matters: it converges to a
+  fixed point and `bdh_cq` does not.
 - `looped_transformer` on `compose`: `AT_CHANCE` fired for all 3 seeds
   (final train loss 8.28-8.33 against ln(vocab)=8.326) -- it never left the
   chance plateau. Per `EXPERIMENT_PLAN` section 10's own Gate A diagnosis
@@ -385,12 +396,166 @@ first pass); `AT_CHANCE` on `looped_transformer`/compose (3/3 seeds) and
 `bdh_cq`/compose (1/3 seeds), discussed above. No `NOT MATCHED` (params
 within tolerance) and no `DIVERGED` seeds.
 
+### A1a. Why `compose` said nothing: the task was mostly unanswerable
+
+Follow-up to the `AT_CHANCE` flags above, run on CPU at zero GPU cost.
+Reproduce with `python tools/task_ceiling.py --task compose`.
+
+`compose` demonstrates `n_examples_per_fn = 4` input/output pairs for each of
+its `d` bijections, drawn **with replacement** from a domain of 8, and then
+draws the query independently. Nothing tied the two together, so the query's
+chain was demonstrated only by luck: `(1 - (1 - 1/8)^4)^d`, which is 0.41 at
+depth 1 and 0.0009 at depth 8. Worse, when the last hop is undemonstrated the
+answer is a symbol that appears **nowhere in the episode** -- symbols are
+remapped per episode, so it is not merely unidentifiable, it is unreachable.
+
+Measured over 2000 episodes per depth against the pre-fix generator:
+
+| depth | split | oracle solvable | target absent from the episode | Bayes-optimal exact match | Bayes-optimal loss (nats) |
+|-------|-------|-----------------|-------------------------------|---------------------------|---------------------------|
+| 1 | train, interp | 0.408 | 0.592 | 0.408 | 4.92 |
+| 2 | train, interp | 0.179 | 0.585 | 0.223 | 6.83 |
+| 3 | mild | 0.078 | 0.584 | 0.125 | 7.66 |
+| 4 | mild | 0.035 | 0.589 | 0.076 | 8.03 |
+| 6 | strong | 0.004 | 0.601 | 0.035 | 8.28 |
+| 8 | strong | 0.000 | 0.557 | 0.026 | 8.31 |
+
+"Bayes-optimal exact match" credits chaining as far as the demonstrations
+allow and then guessing uniformly among the symbols that can still be in the
+terminal domain. Pooled the way the A1 tables report them, the ceilings are
+**interp 0.316, mild 0.100, strong 0.031** -- against ln(vocab) = 8.326, a
+perfect solver on `strong` would sit at 8.28 nats, i.e. indistinguishable from
+chance.
+
+What that does to the A1 `compose` table:
+
+| split | Bayes ceiling | `bdh` (best) | `bdh_cq` (best) | `looped_transformer` |
+|-------|---------------|--------------|-----------------|----------------------|
+| interp | 0.316 | 0.100 (32%) | 0.087 (28%) | 0.001 |
+| mild | 0.100 | 0.053 (53%) | 0.043 (43%) | 0.000 |
+| strong | 0.031 | 0.022 (71%) | 0.018 (58%) | 0.000 |
+
+So `bdh` -- the *non-recurrent control* -- was already at 53-71 percent of
+everything the task allowed on the extrapolation splits, and the largest
+credible effect available on `strong` was 0.031, below this file's own 0.05
+bar. `compose` could not have produced a Gate A finding for or against
+recurrence. It is withdrawn as evidence, in both directions: the
+`looped_transformer` 0.000 is not evidence that it cannot compose either.
+
+The 8.33-nat `AT_CHANCE` plateau is a separate matter and is not explained by
+the ceiling: a perfect solver would sit at 5.9 nats on the train difficulties,
+so `looped_transformer` (3/3 seeds) and `bdh_cq` (1/3) genuinely failed to
+learn even the recoverable part. With 71 percent of each batch carrying an
+answer that is absent from its own context, most of the gradient was noise
+pointing at nothing, which is the most likely reason -- but that is a
+hypothesis, and the fixed generator tests it directly.
+
+**Fixed** (`bdhx/tasks/compose.py`): the query's chain is drawn first and every
+pair it passes through is guaranteed to be among the demonstrations, and the
+remaining demonstrations are drawn without replacement so none is spent on a
+duplicate. Episode length, the difficulty ladder and the distractor count are
+unchanged -- at `n_examples_per_fn = 4` of a domain of 8 there are still 3
+distractor pairs per function -- so `depth` now isolates the number of chaining
+hops and nothing else. Oracle solvability is 1.000 at every depth from 1 to 8.
+The pre-fix distribution stays reachable as `ComposeTask(guarantee_solvable=
+False)` so the A1 numbers remain reproducible, and `GENERATOR_VERSION` moves to
+0.2.0 so the aggregator refuses to merge the two.
+
+Three tests pin it (`tests/test_tasks_compose.py`):
+`test_compose_every_episode_is_solvable_from_its_demonstrations`,
+`test_compose_demonstrations_are_distinct_per_function`, and
+`test_compose_legacy_distribution_is_mostly_unsolvable`. The existing
+`test_target_correctness_compose` did not catch this because it checked the
+target against `extras["fns"]` -- the hidden ground truth no model sees --
+rather than against the demonstrations.
+
+`tools/task_ceiling.py` generalizes the check and is a pre-sweep gate
+(`--min-train-solvable`). Run over the whole suite, `compose` was the only
+broken task: `binding`, `overwrite`, `propagate`, `nested`, `order`,
+`distractors` and `contradict` all sit at 1.000 on every difficulty. In
+particular `propagate`, which carries the Gate A result, is unaffected.
+
+### A1b. Why it falls apart past R_train_max: the loop never converges
+
+Second follow-up, also CPU-only, from the diagnostics already stored in
+`results/*/results.json` plus a probe that reloads the A1 checkpoints.
+Reproduce the table with `python tools/aggregate_results.py` and read
+`recurrence_convergence_propagate.csv` (copied to `docs/results/a1/`).
+
+First, the "collapse to 0.000" is partly the metric. `propagate` targets are
+12-token grids and exact match needs all 12; token accuracy shows a graded
+fall. On `propagate`/`mild`, mean over 3 seeds and both difficulties:
+
+| model | metric | R=1 | R=2 | R=4 | R=8 | R=16 | R=32 |
+|-------|--------|-----|-----|-----|-----|------|------|
+| bdh_cq | token acc | 0.931 | 0.916 | 0.952 | 0.596 | 0.674 | 0.461 |
+| bdh_cq | exact match | 0.471 | 0.276 | 0.579 | 0.000 | 0.000 | 0.000 |
+| looped_transformer | token acc | 0.802 | 0.812 | 0.819 | 0.810 | 0.746 | 0.666 |
+| looped_transformer | exact match | 0.003 | 0.018 | 0.029 | 0.038 | 0.055 | 0.019 |
+
+A CPU sweep of one seed over the intermediate R values the sweep skipped
+(R = 5, 6, 7 on `mild`/distance=6) confirms the shape: per-token accuracy runs
+0.96 at R=4, 0.86 at R=5, 0.71 at R=6, 0.63 at R=7, 0.60 at R=8. The
+degradation is smooth; the 12-token conjunction turns it into a cliff. The
+first answer token is *not* the casualty -- it still agrees with the R=4
+prediction on 60-100 percent of episodes at every R up to 32.
+
+Second, and this is the mechanism: `cos(H[R], H[R-1])` at the final iteration,
+which is 1.0 exactly when the loop has reached a fixed point.
+
+| model | split | R=1 | R=2 | R=4 | R=8 | R=16 | R=32 |
+|-------|-------|-----|-----|-----|-----|------|------|
+| bdh_cq | interp | 0.231 | 0.855 | 0.870 | 0.910 | 0.783 | 0.802 |
+| bdh_cq | mild | 0.194 | 0.821 | 0.793 | 0.949 | 0.767 | 0.742 |
+| bdh_cq | strong | 0.819 | 0.835 | 0.937 | 0.949 | 0.952 | 0.967 |
+| looped_transformer | interp | 0.479 | 0.931 | 0.991 | 0.999 | 1.000 | 1.000 |
+| looped_transformer | mild | 0.475 | 0.931 | 0.991 | 0.999 | 1.000 | 1.000 |
+| looped_transformer | strong | 0.634 | 0.964 | 0.996 | 0.999 | 1.000 | 1.000 |
+
+The looped Transformer converges: monotone to 1.0000 by R=32 on every split of
+both tasks. BDH-CQ does not. On the two splits where it actually learned
+`propagate`, its per-step cosine peaks in the 0.79-0.95 range and then *falls*
+as R grows -- the state keeps rotating by roughly 35-40 degrees per iteration
+no matter how long the loop runs, so H[32] is nowhere near H[4]. A direct
+measurement on the seed-1 checkpoint agrees: `cos(H[R], H[4])` is 0.84 at R=5,
+0.66 at R=8, 0.43 at R=16 and 0.40 at R=32.
+
+The one place BDH-CQ *does* look convergent is `strong` (0.82 rising to 0.97),
+where its token accuracy is flat at 0.63-0.65 across every R -- it has settled
+because it has given up. Where it works it does not converge; where it
+converges it has nothing to say.
+
+Two candidate mechanisms were tested and ruled out:
+
+- **Unbounded Hebbian writes.** The latent loop writes `k^T v` at every step
+  with no decay, so a plausible story was that the memory drowns the
+  demonstrations. It does not: `||M||_F` grows 113,625 -> 126,314 (R=4) ->
+  127,063 (R=8), i.e. 0.6 percent between the working and failing settings.
+  Freezing latent writes at eval time (`update_latent_memory=False`) drives
+  exact match to 0.000 at *every* R including R=4, so the writes are load
+  bearing, not the fault.
+- **Numerical blow-up.** Ruled out for the reason the original bullet gave,
+  though not by the evidence it gave: `||H||` is pinned by a parameter-free
+  LayerNorm and could not have blown up. NaN counts are 0 throughout.
+
+This makes H7 (`EXPERIMENT_PLAN` section 3: "initial-state skips reduce
+recurrent drift") the live hypothesis, and gives it a measurable target that
+does not depend on accuracy at all: raise `cos_last` at R=32 toward 1.0. The
+community `attn_residual` -- whose author states it stabilizes recurrence
+beyond 4 steps -- adds zero parameters and is the cheapest arm to test.
+
 ### A2. Recurrence curriculum repeat
 
-Pending. Not started: Gate A passed conditionally on `propagate`/mild for
-`bdh_cq`, which under `EXPERIMENT_PLAN` section 10 is grounds to proceed,
-but the collapse at `R_test > R_train_max` and the `compose` learnability
-flags above are worth resolving first (see Stage A findings).
+Pending, and A1b argues it is no longer the right next sweep. A curriculum
+teaches the readout to tolerate states from more values of R; it does not stop
+the state from rotating, and A1b shows the rotation is what is happening. A
+curriculum arm that ends at R=8 would very likely just move the peak from R=4
+to R=8 and reproduce the same fall past it -- which is a real prediction A2
+would test, but a cheap one to get wrong for 24 GPU-hours.
+
+The revised proposal (`configs/stage_a/a2_curriculum.yaml` unchanged;
+`configs/stage_c/c1_recurrence_engineering.yaml` narrowed to
+`configs/stage_a/a4_convergence.yaml`) is in "Next experiment and why" below.
 
 ### Stage A findings
 
@@ -405,15 +570,20 @@ real infrastructure failures.
 **What worked:** `bdh_cq` (community) shows a large, credible improvement
 over the matched fixed-depth baseline at `R_test = R_train_max` on
 `propagate`'s `mild` split (Gate A finding above) -- the first positive
-recurrence result this project has produced with real seeds. Diagnostics
-confirm the mechanism collapsing past `R_train_max` is a readout
-generalization failure, not a numerical instability, which narrows what A2
-needs to fix.
+recurrence result this project has produced with real seeds. The follow-up
+diagnoses (A1a, A1b), both run on CPU from the checkpoints and results the
+sweep already produced, cost zero GPU-hours and turned "it collapses, we do
+not know why" into a specific, measurable mechanism: the latent loop does not
+converge, and the metric that would show that (`cos_last` at large R) does not
+need accuracy at all.
 
-**What failed:** `compose` did not produce a credible improvement for any
-model, and two of three models did not reliably learn it at all at this
-budget (`AT_CHANCE` flags above). `bdh_cq`'s `propagate` win does not extend
-past `R_train_max` -- Gate D fails for this model on this task. Getting
+**What failed:** `compose` produced nothing usable, and A1a shows it could not
+have: its generator left 71 percent of training episodes with an answer that
+is absent from their own context, capping Bayes-optimal exact match at 0.10 on
+`mild` and 0.03 on `strong`. That is a defect this project shipped and its own
+task tests missed, because they checked the target against hidden ground truth
+rather than against the demonstrations. `bdh_cq`'s `propagate` win does not
+extend past `R_train_max` -- Gate D fails for this model on this task. Getting
 here also surfaced (and fixed, each with a regression test) six real bugs
 that a live GPU sweep is apparently required to find: two crashes in
 existing framework code (`diagnostics.py`'s `torch.quantile` device
@@ -425,24 +595,64 @@ rows inflating `n_seeds` after a job got relaunched post-completion). None
 of the six were caught by the existing CPU-only test suite; all six were
 only found by actually running the sweep.
 
+A seventh defect, found by A1b and fixed here, is in the reporting rather than
+the runs: `state_norm_vs_iteration` and `cos_consecutive_vs_iteration` pooled
+every checkpoint, split, difficulty and R_test into one unlabelled overlay,
+and their backing CSVs carried only `(iteration, value)`. That is what the
+first version of the A1 diagnostics bullet read a fixed point off. The series
+are now labelled with seed, step, R_test, split and difficulty; the plots show
+the final checkpoint only; and `recurrence_convergence_<task>.csv` reports
+`cos_last` next to accuracy per cell, which is the comparison
+`EXPERIMENT_PLAN` section 6 actually asks for.
+
 **Confidence:** provisional. 3 seeds per cell, as flagged. The `propagate`
 Gate A finding has disjoint bootstrap CIs and a large effect size, which is
 about as strong as a 3-seed result gets, but a `[1,2,3,4,5]`-seed repeat is
 the right bar before treating it as settled, per this file's own
-conventions.
+conventions. The A1a ceilings are analytic and confirmed at 2000 episodes per
+cell, so they are not provisional. The A1b convergence table is 3 seeds x 1000
+eval episodes on the same runs as A1, and the effect it reports (1.0000 vs
+0.74-0.80 at R=32) is far larger than its seed spread, but it compares two
+architectures on one task and should not be generalized past that.
 
 **Compute spent:** see the compute ledger below (~72 GPU-hours estimated,
 ~$54 on RTX 4090 Secure Cloud, over the ~$25 gate approved with explicit
-sign-off after Community Cloud proved unreliable for this sweep).
+sign-off after Community Cloud proved unreliable for this sweep). A1a and A1b
+added 0 GPU-hours: both ran on CPU against checkpoints and `results.json`
+files the sweep had already produced.
 
-**Next experiment and why:** two candidates, not yet started. (1) A2
-(recurrence curriculum repeat) as originally planned, now informed by the
-`R_test > R_train_max` collapse: worth trying a curriculum that includes at
-least one training R beyond what A1 used, to see whether the readout
-generalization failure is a curriculum artifact rather than an
-architectural ceiling. (2) A `compose`-specific pipeline check (per the
-`AT_CHANCE` diagnosis above) before spending more GPU-hours on `compose` at
-this scale.
+**Next experiment and why:** A1a and A1b changed the ordering. `compose` is
+fixed but has never been run against a model, and the drift diagnosis, not the
+curriculum, is now the live hypothesis. In priority order:
+
+1. **A1c, `compose` re-run** (`configs/stage_a/a1c_compose_rerun.yaml`, 9 jobs
+   = 3 models x 3 seeds, 36.0 GPU-hours, ~$26.6 at RTX 4090 Secure). The
+   identical A1 arms on the fixed generator. This is the only way `compose`
+   re-enters the evidence base, and the cheapest way to find out whether
+   `looped_transformer` fails to compose or merely failed to learn from a
+   corpus in which 71 percent of answers were unreachable.
+   `tools/task_ceiling.py --task compose --min-train-solvable 0.99` gates it.
+2. **A4, convergence engineering** (`configs/stage_a/a4_convergence.yaml`,
+   9 jobs = `bdh_cq` x {attn_residual, init_skip, residual} x 3 seeds on
+   `propagate`, 54.6 GPU-hours, ~$40.4). A narrowed slice of Stage C's C1,
+   pulled forward because A1b gives it a target the accuracy tables cannot:
+   does any of the three raise `cos_last` at R=32 above the 0.74-0.80 that
+   plain BDH-CQ sits at, and does accuracy past R_train_max follow? `plain`
+   is not in the grid -- A1's three `bdh_cq`/`propagate` seeds already are that
+   cell, on an identical config and an unchanged `propagate` generator -- which
+   is 3 jobs and ~$13 not spent twice.
+3. **A2 as written**, last rather than first, and best read as a control for
+   (2): if the drift diagnosis is right, a curriculum should move the accuracy
+   peak to the largest trained R without changing `cos_last` at all.
+
+Neither (1) nor (2) is started: both need GPU time and therefore an explicit
+cost decision, given that A1 overran its $25 gate to ~$54. A **combined pilot**
+answers both go/no-go questions for about $4.50: one seed per arm at 20 percent
+of the step budget (8000 steps), 2.4 GPU-hours / ~$1.80 for A1c and 3.6
+GPU-hours / ~$2.70 for A4. Both questions are visible early -- `AT_CHANCE` is a
+property of the training loss, and `cos_last` at R=32 is a property of the
+learned map, not of its final accuracy -- so a pilot that shows no movement in
+either is a real reason not to spend the remaining $63.
 
 ## Stage B: memory mechanisms
 
@@ -480,4 +690,5 @@ Gate D finding: pending.
 | 2026-09-03 | A | a1_cpu_mini (first version, depth 1, N(0,1) tied head) | none (4 CPU cores) | 0.0 | 0.00 | 9 dev jobs, 1436 s wall clock; superseded, the runs were AT_CHANCE by construction |
 | 2026-09-03 | A | a1_cpu_mini (re-run, depth 2, fixed init) | none (4 CPU cores) | 0.0 | 0.00 | 9 dev jobs, 1299 s wall clock total; pipeline validation only, not evidence; all 9 AT_CHANCE on compose |
 | 2026-09-03 | A | Gate A diagnosis (binding, sanity_learnability + BDH acceptance runs) | none (4 CPU cores) | 0.0 | 0.00 | about 20 CPU jobs of 3000 steps each plus a standalone reference reproduction; see section A0 |
+| 2026-09-05 | A | A1a task-ceiling audit + A1b convergence diagnosis | none (CPU) | 0.0 | 0.00 | `tools/task_ceiling.py` over all 9 tasks; a checkpoint probe over `bdh_cq`/`propagate` at R = 1..32; re-aggregation of the existing `results/`. No new training: both diagnoses reused the A1 checkpoints and results.json files. |
 | 2026-09-04/05 | A | a1_first_experiment (18 jobs: 3 models x 2 tasks x 3 seeds, ~10M params) | RTX 4090, Secure Cloud | ~72 | ~54 | Estimate = sum of `generated/a1_first_experiment/manifest.csv`'s profiled per-job minutes (49.07 min/job bdh, 364.10 bdh_cq, 306.62 looped_transformer; 71.98 GPU-hours) x $0.74/hr (`configs/runpod_rates.yaml`, RTX 4090 Secure). This undercounts real elapsed wall clock: Community Cloud failed to boot repeatedly (5+ times) before the sweep moved to Secure, one job (`76dd99c62a3e_s1`) alone cycled through 11 distinct pod attempts, and several jobs were relaunched after already reaching their final checkpoint (a bug found and fixed mid-sweep, see Stage A findings) -- but a pod that never boots shows `uptimeSeconds=0` and is not believed to be billed, so those retries are assumed near-$0 rather than added on top. Exceeded the $25 cost gate approved for this sweep; re-approved by explicit user sign-off at ~$32 estimated before the Community-to-Secure switch (which itself raised the per-hour rate from $0.34 to $0.74), so the real total landed higher still. All pods reaped; `runpod status` and a direct `get_pods()` check both confirmed zero pods remaining on the account at sweep end. |

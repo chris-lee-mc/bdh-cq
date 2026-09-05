@@ -152,11 +152,24 @@ symbol tokens; `->` denotes a demonstration pair.
 - Generator: sample `d` random bijections `f_1 .. f_d` over disjoint
   symbol sets (domain of `f_i` = codomain of `f_{i-1}`). Demonstrations
   show `n_examples_per_fn` input/output pairs for each function
-  individually. Query: an input `x` in the domain of `f_1`, tagged with
-  the composition to apply (the tag is a fixed structural sequence
-  `[COMPOSE] d`). Target: `f_d(...f_1(x))`.
-- Knobs: `depth` d in {1, 2, 3, 4, 6, 8}; `n_examples_per_fn`;
-  `domain_size`.
+  individually, drawn without replacement. Query: an input `x` in the
+  domain of `f_1`, tagged with the composition to apply (the tag is a fixed
+  structural sequence `[COMPOSE] d`). Target: `f_d(...f_1(x))`.
+- Solvability (REQUIRED): the query's chain is sampled first and the `d`
+  pairs it passes through are always among the demonstrations, so every
+  episode is answerable from its own demonstrations at every depth. This is
+  not optional polish. Without it the answer is derivable in only
+  `(1 - (1 - 1/domain_size) ** n_examples_per_fn) ** d` of episodes -- 0.41 at
+  depth 1 and 0.001 at depth 8 for the defaults -- and in the rest the target
+  is a symbol that appears nowhere in the episode, so Bayes-optimal exact
+  match on the `strong` split is 0.03 and no result on the task can clear the
+  0.05 credibility bar of `EXPERIMENT_PLAN` section 9. That was the shipped
+  behaviour through the A1 sweep; see `RESULTS.md` section A1a for the
+  measurement, and `tools/task_ceiling.py` for the pre-sweep gate that now
+  catches it. `ComposeTask(guarantee_solvable=False)` reproduces the old
+  distribution for reproducing A1.
+- Knobs: `depth` d in {1, 2, 3, 4, 6, 8}; `n_examples_per_fn` (clamped to
+  `domain_size`, since the draw is without replacement); `domain_size`.
 - Train: depth {1, 2}. Interp: {1, 2}. Mild: {3, 4}. Strong: {6, 8}.
 - Metric: exact match vs depth; `partial_depth_acc` (largest prefix depth
   whose intermediate result would have been correct, reconstructed from
@@ -270,6 +283,15 @@ more loops is doing something other than iterative computation.
   the same second episode as a fresh generator with the same rng.
 - `test_target_correctness`: brute-force reference solver agrees with the
   generator's target for every task (e.g. apply functions literally for
-  T5, simulate propagation for T6, sort for T8).
+  T5, simulate propagation for T6, sort for T8). Note that this solver may
+  read `episode.extras`, so it proves the target is CORRECT, not that it is
+  REACHABLE -- the next check is the one that does that, and its absence is
+  why the T5 defect of `RESULTS.md` section A1a survived a full GPU sweep.
+- `test_solvable_from_demonstrations`: a solver restricted to what a model
+  sees -- the demonstrations and the query, never `extras` -- recovers the
+  target on every episode of every train and eval difficulty. Where no such
+  solver is practical, the weaker check is that every target symbol appears
+  somewhere in the episode. `tools/task_ceiling.py` runs both across the
+  suite and doubles as a pre-sweep gate (`--min-train-solvable`).
 - `test_overwrite_target_is_latest`: T2 target equals the most recent
   value.
