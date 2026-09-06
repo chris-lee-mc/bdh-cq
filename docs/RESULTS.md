@@ -844,16 +844,37 @@ avoidable and is written up in the ledger.
 
 ### A2. Recurrence curriculum repeat
 
-Pending, and A1b argues it is no longer the right next sweep. A curriculum
-teaches the readout to tolerate states from more values of R; it does not stop
-the state from rotating, and A1b shows the rotation is what is happening. A
-curriculum arm that ends at R=8 would very likely just move the peak from R=4
-to R=8 and reproduce the same fall past it -- which is a real prediction A2
-would test, but a cheap one to get wrong for 24 GPU-hours.
+Pending, and **it does not test what this document twice said it tests.**
 
-The revised proposal (`configs/stage_a/a2_curriculum.yaml` unchanged;
-`configs/stage_c/c1_recurrence_engineering.yaml` narrowed to
-`configs/stage_a/a4_convergence.yaml`) is in "Next experiment and why" below.
+The claim made here and in "Next experiment and why" was that A2 probes
+whether the readout is the binding constraint, on the reasoning that "a
+curriculum arm that ends at R=8 would very likely just move the peak from R=4
+to R=8". `configs/stage_a/a2_curriculum.yaml` has no arm that ends at R=8. Its
+curriculum is `schedule: [1, 2, 4]` over `train_steps: [1, 2, 4]`, so
+`RTrainSampler.r_max` is 4 in the curriculum arm and 4 in the uniform arm.
+Running the sampler over the full 40000 steps, the entire difference the sweep
+creates is the share of steps spent at each R:
+
+| arm | R=1 | R=2 | R=4 | R_train_max |
+|-----|-----|-----|-----|-------------|
+| uniform | 33% | 33% | 34% | 4 |
+| curriculum | 30% | 30% | 40% | 4 |
+
+A2 therefore asks whether the *order* of exposure matters at a fixed maximum.
+That is a real question and A4 gives no particular reason to expect a yes on
+it, but it cannot move an accuracy peak past a value it never trains, so it
+cannot discriminate the two hypotheses A4 left standing. It is also 24 jobs,
+half of which (`reasoning.train_step_sampling: uniform`) re-run A1 cells that
+already exist.
+
+`configs/stage_a/a5_r_train_extension.yaml` is the sweep that does test it:
+one arm, `train_steps: [1, 2, 4, 8]`, against A1's `[1, 2, 4]` cell, 3 jobs
+and ~$4. See "Next experiment and why" below. A2 is worth keeping only as a
+follow-up if A5 says the peak does move -- at which point how to spend a fixed
+R budget becomes a live question rather than an academic one.
+
+`tests/test_configs_stage_a.py` now pins the `r_max == 4` fact, so this
+section cannot quietly revert to describing A2 as an extrapolation probe.
 
 ### Stage A findings
 
@@ -936,15 +957,21 @@ curriculum, is now the live hypothesis. In priority order:
    0.000 at R=8 for all three arms and all 9 seeds. The half of the question
    this entry treated as the interesting half was answered yes, and it turned
    out not to be the half that mattered.
-3. **A2 as written**, last rather than first, and best read as a control for
-   (2): if the drift diagnosis is right, a curriculum should move the accuracy
-   peak to the largest trained R without changing `cos_last` at all. **A4
-   changes what this tests.** Drift is no longer a candidate cause, so A2 is
-   now the more direct probe of the two remaining ones: whether the readout is
-   the binding constraint (a curriculum should move the peak) or whether
-   BDH-CQ cannot represent more than `R_train_max` compositions of the
-   operation at all (it should not). That makes it the cheapest live question
-   in Stage A, not the last.
+3. **A5, extend R_train_max** (`configs/stage_a/a5_r_train_extension.yaml`,
+   3 jobs = `bdh_cq`/`plain` on `propagate` with `train_steps: [1,2,4,8]` x 3
+   seeds, 5.35 GPU-hours, ~$3.96, ~$5.15 with contingency). **The cheapest
+   live question in Stage A, and the next one to run.** A4 leaves exactly two
+   hypotheses -- the readout has only ever been asked to read states from R in
+   {1,2,4} (so the peak should follow the trained set), or BDH-CQ cannot
+   compose the operation more than a few times whatever it is shown (so it
+   should not). They differ on one manipulation that no run in this project
+   has made: training outside {1,2,4}. Reuses A1's arm as the R_train_max=4
+   reference on the same verified-matched basis A4 used -- both build at
+   10,010,880 params, because `build_model()` never passes `r_max` and
+   `plain`'s runner adds none -- so it is 3 jobs, not 6.
+4. ~~**A2 as written**~~ **Demoted: it cannot test this.** Both of A2's arms
+   cap `R_train_max` at 4; see section A2 above for the numbers. Worth running
+   only if A5 says the peak moves.
 
 (2) is done. (1) is not started and still needs an explicit cost decision.
 The combined 8000-step pilot proposed here was run (section A1c/A4 pilots) and
