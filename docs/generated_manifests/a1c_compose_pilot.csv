@@ -1,4 +1,4 @@
 exp,config_hash,seed,model,task,control_of,est_gpu_minutes
-exp_000,01960a81500f,1,bdh,compose,,10.8
-exp_001,eb4c0c5652db,1,bdh_cq,compose,,80.1
-exp_002,7b5270d29d49,1,looped_transformer,compose,,67.46
+exp_000,01960a81500f,1,bdh,compose,,12.76
+exp_001,eb4c0c5652db,1,bdh_cq,compose,,94.67
+exp_002,7b5270d29d49,1,looped_transformer,compose,,79.72
