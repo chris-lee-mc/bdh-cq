@@ -943,8 +943,16 @@ def collect(
         try:
             with tarfile.open(tar_path) as tf:
                 tf.extractall(out_dir, filter="data")
-        except tarfile.TarError as e:
-            skipped.append({"run_id": run_id, "reason": f"bad tarball: {e}"})
+        except Exception as e:  # noqa: BLE001 - one run's bad tarball must not sink the batch
+            # Deliberately broad, and NOT just tarfile.TarError: a truncated
+            # download surfaces as zlib.error and a full disk as OSError,
+            # neither of which is a TarError. Letting either propagate aborts
+            # the whole loop, so every run after it goes uncollected -- and an
+            # uncollected pod keeps billing, which is exactly what happened on
+            # this project's first real collect (a 100%-full disk mid-extract
+            # left three pods alive and idle). Skipping records the failure and
+            # leaves the pod up so a later `collect` can retry it.
+            skipped.append({"run_id": run_id, "reason": f"bad tarball: {type(e).__name__}: {e}"})
             continue
         finally:
             tar_path.unlink(missing_ok=True)

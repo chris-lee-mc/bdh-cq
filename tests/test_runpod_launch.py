@@ -1277,3 +1277,119 @@ def test_http_text_survives_a_missing_curl(monkeypatch):
 
     monkeypatch.setattr("subprocess.run", no_curl)
     assert _http_text("https://example.invalid/EXIT_CODE") is None
+
+
+def _truncated_tarball(tmp_path, run_id: str) -> bytes:
+    """A .tar.gz that OPENS cleanly but fails partway through extraction.
+
+    This is the shape a cut-off download actually takes, and the reason the
+    naive corrupt-bytes fixture is useless here: garbage after a gzip magic
+    number fails in tarfile.open() as a ReadError, which IS a TarError and was
+    already handled. A real truncation gets far enough for the first member
+    header to decompress, then dies inside copyfileobj with a zlib.error.
+    """
+    import os
+    import tarfile
+
+    src = tmp_path / "trunc_src" / run_id
+    src.mkdir(parents=True, exist_ok=True)
+    # Incompressible, so the gzip stream stays long enough to cut in half.
+    (src / "checkpoint.pt").write_bytes(os.urandom(2_000_000))
+    whole = tmp_path / f"{run_id}-whole.tar.gz"
+    with tarfile.open(whole, "w:gz") as tf:
+        tf.add(src, arcname=run_id)
+    return whole.read_bytes()[: len(whole.read_bytes()) // 2]
+
+
+def test_truncated_tarball_fixture_really_fails_during_extraction(tmp_path):
+    """Guard the guard: if this ever fails at open() instead, the two
+    regression tests below stop testing anything, because a ReadError was
+    caught by the old code too."""
+    import tarfile
+
+    path = tmp_path / "t.tar.gz"
+    path.write_bytes(_truncated_tarball(tmp_path, "r1"))
+    with tarfile.open(path) as tf, pytest.raises(Exception) as exc:  # open must NOT raise
+        tf.extractall(tmp_path / "out", filter="data")
+    assert not isinstance(exc.value, tarfile.TarError), (
+        f"fixture raised {type(exc.value).__name__}, which the old handler already caught"
+    )
+
+
+def test_collect_survives_a_truncated_download_and_still_collects_the_rest(tmp_path):
+    """A corrupt tarball must not abort collection of the runs after it.
+
+    Regression test for a real incident: the disk filled mid-extract, the
+    resulting error was not a tarfile.TarError, so it propagated out of
+    collect() and every run after it went uncollected -- leaving those pods
+    alive and billing.
+    """
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=3,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert len(created) == 3
+    bad_run_id = created[0].run_id
+    bad_bytes = _truncated_tarball(tmp_path, bad_run_id)
+
+    def fetch(url, dest):
+        run_id = url.rsplit("/", 1)[-1].removesuffix(".tar.gz")
+        if run_id == bad_run_id:
+            dest.write_bytes(bad_bytes)
+            return True
+        src = tmp_path / "src" / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text("{}")
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(src, arcname=run_id)
+        return True
+
+    out_dir = tmp_path / "out"
+    result = collect(d, out_dir, state_path=state_path, client=client, fetch=fetch)
+
+    assert sorted(result["pulled"]) == sorted(r.run_id for r in created[1:])
+    assert [s["run_id"] for s in result["skipped"]] == [bad_run_id]
+    assert "bad tarball" in result["skipped"][0]["reason"]
+    for rec in created[1:]:
+        assert (out_dir / rec.run_id / "results.json").exists()
+    assert not (out_dir / f"{bad_run_id}.tar.gz").exists()  # partial cleaned up
+
+
+def test_collect_leaves_the_pod_alive_when_its_tarball_is_corrupt(tmp_path):
+    """A failed collect must not terminate the pod: it holds the only copy."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    bad_bytes = _truncated_tarball(tmp_path, created[0].run_id)
+
+    def corrupt_fetch(url, dest):
+        dest.write_bytes(bad_bytes)
+        return True
+
+    result = collect(
+        d,
+        tmp_path / "out",
+        state_path=state_path,
+        client=client,
+        fetch=corrupt_fetch,
+        terminate_on_collect=True,
+    )
+    assert result["pulled"] == []
+    assert created[0].pod_id not in client.terminated

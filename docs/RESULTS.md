@@ -498,7 +498,16 @@ broken task: `binding`, `overwrite`, `propagate`, `nested`, `order`,
 `distractors` and `contradict` all sit at 1.000 on every difficulty. In
 particular `propagate`, which carries the Gate A result, is unaffected.
 
-### A1b. Why it falls apart past R_train_max: the loop never converges
+### A1b. The loop does not converge past R_train_max, but that is not why it falls apart
+
+**Superseded in its causal claim by section A4.** This section's original
+title was "Why it falls apart past `R_train_max`: the loop never converges",
+and the diagnosis below is sound as far as it measures: the loop genuinely
+does not settle. What it did not establish, and what A4 has since tested
+directly, is that the non-convergence *causes* the accuracy collapse. It does
+not. A4's `residual` arm holds `cos_last` at 1.0000 at R=32 and still scores
+exact match 0.000 at R=8. Read everything below as a description of a real
+symptom, not of the mechanism.
 
 Second follow-up, also CPU-only, from the diagnostics already stored in
 `results/*/results.json` plus a probe that reloads the A1 checkpoints.
@@ -561,10 +570,14 @@ Two candidate mechanisms were tested and ruled out:
   though not by the evidence it gave: `||H||` is pinned by a parameter-free
   LayerNorm and could not have blown up. NaN counts are 0 throughout.
 
-This makes H7 (`EXPERIMENT_PLAN` section 3: "initial-state skips reduce
+~~This makes H7 (`EXPERIMENT_PLAN` section 3: "initial-state skips reduce
 recurrent drift") the live hypothesis. The community `attn_residual` -- whose
 author states it stabilizes recurrence beyond 4 steps -- adds zero parameters
-and is the cheapest arm to test.
+and is the cheapest arm to test.~~ **Struck: tested and refuted in A4.** Both
+mechanisms do what they claim -- `attn_residual` takes `cos_last` at R=32 from
+0.802 to 0.999 -- and neither moves exact match past `R_train_max` off 0.000.
+H7's own arm, `init_skip`, was additionally the weakest of the three at the
+convergence target it was proposed for.
 
 ~~It also gives H7 a measurable target that does not depend on accuracy at
 all: raise `cos_last` at R=32 toward 1.0.~~ **Struck.** The A4 pilot and
@@ -747,6 +760,88 @@ roughly 6x conservative. `runpod_launch.py estimate` still reports the
 conservative figure; it has not been changed, because a launcher that
 under-quotes is worse than one that over-quotes.
 
+### A4. Convergence is fixable, and fixing it changes nothing
+
+Full sweep, 9 jobs (3 update rules x 3 seeds, 40000 steps, `propagate`, ~10M
+params), `configs/stage_a/a4_convergence.yaml`, read against A1's
+`bdh_cq`/`plain` cell as the reference arm. All 9 exit 0 at step 40000 with
+final train loss between 6.7e-5 and 4.7e-4: 0 AT_CHANCE seeds, 0 diverged
+seeds, 0 relaunches. Tables in `reports/2026-09-06-a4/`, copied to
+`docs/results/a4/`.
+
+**The primary metric was joint, and two arms pass it.** `interp` split, final
+checkpoint, mean over 3 seeds and 3 difficulty buckets:
+
+| arm | cos_last @ R=32 | exact match @ R=4 |
+|-----|-----------------|-------------------|
+| bdh_cq / plain (A1 reference) | 0.802 | 0.997 |
+| bdh_cq / init_skip | 0.849 | 0.990 |
+| bdh_cq / attn_residual | 0.999 | 0.998 |
+| bdh_cq / residual | **1.000** | **1.000** |
+| looped_transformer / plain | 1.000 | 1.000 |
+
+The question A4 was opened with therefore answers yes. `residual` --
+`h + block(h)`, the cheapest arm in the grid, included only as the control
+that would say whether `init_skip`'s gain needed the seed specifically or just
+a smaller step -- puts BDH-CQ's loop exactly in the looped Transformer's
+regime. It holds `cos_last` at 1.0000 at every difficulty at R=8, 16 and 32
+while learning the task to exact match 0.9997. `attn_residual`, the community
+mechanism, reaches 0.9993. H7's own arm, `init_skip`, is the one that does not
+work: 0.849 against plain's 0.802 is the smallest gain in the table, and the
+control beat the hypothesis it was there to control for.
+
+**And it buys nothing.** Exact match past `R_train_max = 4`, same split and
+checkpoint:
+
+| arm | R=4 | R=8 | R=16 | R=32 |
+|-----|-----|-----|------|------|
+| bdh_cq / plain | 0.997 | 0.000 | 0.000 | 0.000 |
+| bdh_cq / init_skip | 0.990 | 0.000 | 0.000 | 0.000 |
+| bdh_cq / attn_residual | 0.998 | 0.000 | 0.000 | 0.000 |
+| bdh_cq / residual | 1.000 | 0.000 | 0.000 | 0.000 |
+| looped_transformer / plain | 1.000 | 0.973 | 0.811 | 0.466 |
+
+Every `bdh_cq` seed of every arm is exactly 0.000 at R >= 8 -- 9 seeds x 3
+difficulties, no exceptions -- so the bootstrap 95% CI is [0.000, 0.000]
+against the looped Transformer's [0.963, 0.980] at R=8. Non-overlapping, and
+the gap is 0.973 against this project's 0.05 threshold.
+
+A model whose loop reaches a perfect fixed point, `cos_last` = 1.0000 to four
+decimals, still scores 0.000 at R=8. **The loop's failure to converge was not
+the cause of the collapse past `R_train_max`.** It was a second, separable
+symptom of whatever is.
+
+Token accuracy carries the same conclusion with more texture, since
+`propagate` exact match needs all 12 tokens of a grid. On `interp` at R=32:
+plain 0.664, `init_skip` 0.651, `attn_residual` 0.586, `residual` 0.770,
+looped Transformer 0.916. `residual` is the only arm that moves it at all, by
+0.106, and remains 0.146 short of the looped Transformer -- real, but nowhere
+near enough to complete a grid. `attn_residual` is *worse* than plain at R=32
+(0.586 against 0.664) while having near-perfect `cos_last`, which is the
+single cleanest number against the convergence hypothesis: inside `bdh_cq`,
+more convergence did not mean more accuracy, and here it meant slightly less.
+
+The `strong` split is the within-sweep control and behaves as it must: no arm
+learns it (exact match 0.000 everywhere), and `residual` still reaches
+`cos_last` 1.000 there. Convergence is available with or without the task,
+which is the same point section A1d made about the 8000-step pilots.
+
+**What this costs the plan.** Stage C's recurrence-engineering direction
+(`configs/stage_c/c1_recurrence_engineering.yaml`) sweeps six further update
+rules against `cos_last`. Five of the six are variations on making the map
+contractive, and A4 shows a map contractive enough to reach `cos_last` =
+1.0000 still scores 0.000 past `R_train_max`. C1 should not be run in its
+current form; the `cos_last` target it is built on has been measured and
+saturated. The open question is now what the looped Transformer does that
+BDH-CQ does not, and it is not fixed-point behaviour, because the two are
+tied at 1.000 on that metric and 0.973 apart on the one that matters.
+
+**Cost.** 9 jobs run fully concurrent, ~100 minutes wall clock, 13.62 billed
+GPU-hours, $10.08. Estimated beforehand at 12.47 GPU-hours / $9.23 from the
+pilot's measured ms/step; the estimate held to within 9 percent. About 1.0
+GPU-hour (~$0.77) of that was pods sitting finished-but-uncollected, which was
+avoidable and is written up in the ledger.
+
 ### A2. Recurrence curriculum repeat
 
 Pending, and A1b argues it is no longer the right next sweep. A curriculum
@@ -835,27 +930,29 @@ curriculum, is now the live hypothesis. In priority order:
    `looped_transformer` fails to compose or merely failed to learn from a
    corpus in which 71 percent of answers were unreachable.
    `tools/task_ceiling.py --task compose --min-train-solvable 0.99` gates it.
-2. **A4, convergence engineering** (`configs/stage_a/a4_convergence.yaml`,
-   9 jobs = `bdh_cq` x {attn_residual, init_skip, residual} x 3 seeds on
-   `propagate`, 54.6 GPU-hours, ~$40.4). A narrowed slice of Stage C's C1,
-   pulled forward because A1b gives it a target the accuracy tables cannot:
-   does any of the three raise `cos_last` at R=32 above the 0.74-0.80 that
-   plain BDH-CQ sits at, and does accuracy past R_train_max follow? `plain`
-   is not in the grid -- A1's three `bdh_cq`/`propagate` seeds already are that
-   cell, on an identical config and an unchanged `propagate` generator -- which
-   is 3 jobs and ~$13 not spent twice.
+2. ~~**A4, convergence engineering**~~ **Done, 2026-09-06, 13.62 GPU-hours /
+   $10.08. See section A4.** It raised `cos_last` at R=32 from 0.802 to 1.000
+   and accuracy past `R_train_max` did *not* follow: exact match stays exactly
+   0.000 at R=8 for all three arms and all 9 seeds. The half of the question
+   this entry treated as the interesting half was answered yes, and it turned
+   out not to be the half that mattered.
 3. **A2 as written**, last rather than first, and best read as a control for
    (2): if the drift diagnosis is right, a curriculum should move the accuracy
-   peak to the largest trained R without changing `cos_last` at all.
+   peak to the largest trained R without changing `cos_last` at all. **A4
+   changes what this tests.** Drift is no longer a candidate cause, so A2 is
+   now the more direct probe of the two remaining ones: whether the readout is
+   the binding constraint (a curriculum should move the peak) or whether
+   BDH-CQ cannot represent more than `R_train_max` compositions of the
+   operation at all (it should not). That makes it the cheapest live question
+   in Stage A, not the last.
 
-Neither (1) nor (2) is started: both need GPU time and therefore an explicit
-cost decision, given that A1 overran its $25 gate to ~$54. A **combined pilot**
-answers both go/no-go questions for about $4.50: one seed per arm at 20 percent
-of the step budget (8000 steps), 2.4 GPU-hours / ~$1.80 for A1c and 3.6
-GPU-hours / ~$2.70 for A4. Both questions are visible early -- `AT_CHANCE` is a
-property of the training loss, and `cos_last` at R=32 is a property of the
-learned map, not of its final accuracy -- so a pilot that shows no movement in
-either is a real reason not to spend the remaining $63.
+(2) is done. (1) is not started and still needs an explicit cost decision.
+The combined 8000-step pilot proposed here was run (section A1c/A4 pilots) and
+was worth its ~$1.15: it is what replaced the ~$40 A4 estimate with the
+measured ~$9 one, and what showed that an accuracy-free `cos_last` target is
+satisfied by not learning. It did not predict A4's actual result, because at
+8000 steps no arm had learned the task yet -- which is the documented limit of
+a pilot that screens on a metric the unlearned model already maximizes.
 
 ## Stage B: memory mechanisms
 
@@ -895,6 +992,8 @@ Gate D finding: pending.
 | 2026-09-03 | A | Gate A diagnosis (binding, sanity_learnability + BDH acceptance runs) | none (4 CPU cores) | 0.0 | 0.00 | about 20 CPU jobs of 3000 steps each plus a standalone reference reproduction; see section A0 |
 | 2026-09-06 | A | a1c/a4 pilots (6 jobs, 1 seed, 8000 steps) | RTX 4090, Secure Cloud | ~1.6 | ~1.15 | All 6 exit 0, collected, pods terminated on collection; `get_pods()` confirmed zero remaining. Training wall clock 0.95 GPU-hours; the rest is boot, clone and pip per pod. Came in at a quarter of the $5.27 estimate because A1's profiled per-job minutes are about 6x conservative for training. Findings in section A1c/A4 above: A1c returned no signal (one-sided by design), A4 refuted its own premise and is worth more than the $40 sweep it was screening. |
 | 2026-09-06 | A | a1c/a4 pilot, first attempt (FAILED, no results) | RTX 4090, Secure Cloud | ~12.1 | ~8.93 | 6 pods launched without `--sweep-config-path`. `generated/` is gitignored, so every job died seconds after boot with FileNotFoundError on its own config. A crashed job still tars its output and sleeps, and RunPod keeps a pod allocated after its docker command exits, so all six billed at $0.74/hr until reaped by hand 2.2 hours later. The 90-minute `--max-wall-clock-minutes` cap did not fire: the API returned no `uptimeSeconds` for any of these pods, and watchdog() skipped every pod it could not time. `print_status` showed "$0.000 so far" throughout for the same reason. All three are fixed with regression tests (`tests/test_runpod_launch.py`): the flag is required, watchdog() falls back to the launcher's own `created_at`, and `status` now reports a job that has already exited. Zero science obtained; the pilot itself was not run. |
+| 2026-09-06 | A | a4_convergence (9 jobs: 3 recurrence kinds x 3 seeds, 40000 steps) | RTX 4090, Secure Cloud | 13.62 | 10.08 | All 9 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Billed hours are per-pod alive time from `runpod_state.jsonl`, not the launcher's `print_status` figure, which still reports "$0.000 so far" when the API withholds `uptimeSeconds`. Estimated beforehand at 12.47 GPU-hours / $9.23 by taking the pilot's measured ms/step (plain 67.7, `attn_residual` 85.3, `init_skip` 81.1) rather than the manifest's profiled `est_gpu_minutes`; the estimate came in 9 percent low, the first cost prediction on this project to land close. Training was 9.22 of the 13.62 hours; the remaining 4.40 is pod boot (~6.5 min each) and the final R in {1,2,4,8,16,32} evaluation, which is markedly more expensive here than in A1 because `R=32` was added to the 16 mid-training checkpoints. About 1.0 GPU-hour (~$0.77) of the overhead was avoidable idle: see the row below. Findings in section A4. |
+| 2026-09-06 | A | a4_convergence, collection failure (no science lost, ~$0.77 wasted) | RTX 4090, Secure Cloud | ~1.0 | ~0.77 | Seven pods sat finished-but-uncollected for roughly 30 minutes. Two independent causes, both now fixed. (1) The completion watch polled for the absence of `RUNNING`, but `print_status` reports a finished-but-uncollected pod as `RUNNING` with a trailing "job exited 0, awaiting collect" -- so the watch could never fire on completion. Poll for the marker, not for the absence of `RUNNING`. (2) `collect` caught only `tarfile.TarError`, so when the local disk hit 100 percent mid-extract the resulting `OSError` (and, on a truncated download, `zlib.error`) propagated out of the loop and every run after it went uncollected -- while its pod kept billing. Now caught per-run with the pod deliberately left alive for retry, with two regression tests in `tests/test_runpod_launch.py` that were checked to fail against the old handler. The disk itself was freed twice over: package caches outside the repo (~8.7 GB, the correct fix) and 30 penultimate training checkpoints (3.6 GB, destructive and unnecessary -- every final checkpoint was kept, but those 30 are gone). |
 | 2026-09-06 | A | A1d convergence-onset analysis | none (CPU) | 0.0 | 0.00 | No new training and no new runs: A1's checkpoints already carried a mid-training evaluation every 2500 steps at R in {1, 4, 16} with diagnostics, 16 per run over 9 runs. A ~$2.50 step-sweep (1 kind, 3 seeds, cos_last checkpointed 8k-40k) was scoped and quoted to the user before that was checked, and then not run. Delivered instead as `convergence_onset_*` in `bdhx/results/aggregate.py`, so the table regenerates from `results/` rather than from a one-off script. Section A1d. |
 | 2026-09-05 | A | A1a task-ceiling audit + A1b convergence diagnosis | none (CPU) | 0.0 | 0.00 | `tools/task_ceiling.py` over all 9 tasks; a checkpoint probe over `bdh_cq`/`propagate` at R = 1..32; re-aggregation of the existing `results/`. No new training: both diagnoses reused the A1 checkpoints and results.json files. |
 | 2026-09-04/05 | A | a1_first_experiment (18 jobs: 3 models x 2 tasks x 3 seeds, ~10M params) | RTX 4090, Secure Cloud | ~72 | ~54 | Estimate = sum of `generated/a1_first_experiment/manifest.csv`'s profiled per-job minutes (49.07 min/job bdh, 364.10 bdh_cq, 306.62 looped_transformer; 71.98 GPU-hours) x $0.74/hr (`configs/runpod_rates.yaml`, RTX 4090 Secure). This undercounts real elapsed wall clock: Community Cloud failed to boot repeatedly (5+ times) before the sweep moved to Secure, one job (`76dd99c62a3e_s1`) alone cycled through 11 distinct pod attempts, and several jobs were relaunched after already reaching their final checkpoint (a bug found and fixed mid-sweep, see Stage A findings) -- but a pod that never boots shows `uptimeSeconds=0` and is not believed to be billed, so those retries are assumed near-$0 rather than added on top. Exceeded the $25 cost gate approved for this sweep; re-approved by explicit user sign-off at ~$32 estimated before the Community-to-Secure switch (which itself raised the per-hour rate from $0.34 to $0.74), so the real total landed higher still. All pods reaped; `runpod status` and a direct `get_pods()` check both confirmed zero pods remaining on the account at sweep end. |
