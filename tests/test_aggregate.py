@@ -422,3 +422,49 @@ def test_diagnostic_series_are_written_per_arm(tmp_path):
     with open(out / "cos_consecutive_vs_iteration_bdh_cq_plain_propagate.csv") as fh:
         rows = list(csv.DictReader(fh))
     assert rows and {"config_hash", "recurrence_kind", "split", "reasoning_steps"} <= set(rows[0])
+
+
+def test_single_iteration_rows_are_flagged_not_comparable(tmp_path):
+    """`cos_last` at R=1 is cos(H[1], seed), not cos(H[R], H[R-1]).
+
+    The diagnostics compare iteration 0 against the ingested seed rather than a
+    previous latent, so a one-iteration run's only value measures a different
+    thing from the R=32 rows beside it in the same CSV. Flagged rather than
+    dropped: the row stays visible and explicitly uncomparable.
+    """
+    from bdhx.results.aggregate import convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    run_dir = root / "h0_s1"
+    writer = ResultsWriter(
+        run_dir,
+        run_id="h0_s1",
+        config_hash="h0",
+        seed=1,
+        model="bdh_cq",
+        task="propagate",
+        params=10,
+        status="ok",
+    )
+    for r, cos in ((1, [0.21]), (32, [0.21, 0.8, 0.74])):
+        writer.add_evaluation(
+            {
+                "step": 100,
+                "reasoning_steps": r,
+                "split": "mild",
+                "difficulty": {"distance": 6},
+                "n_episodes": 10,
+                "exact_match": 0.0,
+                "token_acc": 0.5,
+                "diagnostics": {"cos_consecutive": cos, "nan_count": 0},
+            }
+        )
+    writer.flush()
+    (run_dir / "metadata.json").write_text(
+        json.dumps({"config": {"experiment": {"tags": []}, "model": {"recurrence": {}}}})
+    )
+
+    by_r = {r["reasoning_steps"]: r for r in convergence_rows(walk_runs(root), "propagate")}
+    assert by_r[1]["cos_last_vs_seed"] == 1.0
+    assert by_r[32]["cos_last_vs_seed"] == 0.0

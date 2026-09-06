@@ -490,6 +490,7 @@ CONVERGENCE_COLUMNS = (
     "reasoning_steps",
     "n_seeds",
     "cos_last",
+    "cos_last_vs_seed",
     "cos_min_after_first",
     "token_acc",
     "exact_match",
@@ -560,6 +561,11 @@ def convergence_rows(records: list[RunRecord], task: str) -> list[dict[str, Any]
                     # Iteration 0 compares against the ingested seed, not against
                     # a previous latent, so it is excluded from the minimum.
                     "cos_min_after_first": min(cos[1:]) if len(cos) > 1 else cos[-1],
+                    # ... which also means a single-iteration run's `cos_last` IS
+                    # that seed comparison, and is not the same quantity as the
+                    # R=32 rows it sits next to. Flagged rather than dropped, so
+                    # the row stays visible and uncomparable rather than absent.
+                    "cos_last_vs_seed": float(len(cos) == 1),
                     "token_acc": ev.token_acc,
                     "exact_match": ev.exact_match,
                 }
@@ -581,6 +587,7 @@ def convergence_rows(records: list[RunRecord], task: str) -> list[dict[str, Any]
                     field_name: mean(s[field_name] for s in seeds)
                     for field_name in (
                         "cos_last",
+                        "cos_last_vs_seed",
                         "cos_min_after_first",
                         "token_acc",
                         "exact_match",
