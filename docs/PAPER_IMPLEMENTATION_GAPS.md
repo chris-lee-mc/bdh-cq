@@ -71,9 +71,22 @@ validity. Line numbers refer to the commit above.
    Stage A evaluates to 64; expect numerical surprises and instrument for
    them.
 4. Structural assertions ("latent reasoning cannot be the final stage")
-   fire only in the loss path (`bdh_cq.py:568, 572`); a bare forward that
-   ends on an int stage silently returns stale logits. The adapter must
-   never call the wrapper that way, and a test should cover it.
+   fire only in the loss path (`bdh_cq.py:568, 572`, both after the
+   `if not return_loss` early return at `:560-566`); a bare forward that
+   ends on an int stage silently returns stale logits -- those of the last
+   TENSOR stage, from before the reasoning ran, identical for every step
+   count. Confirmed by running it, at upstream HEAD `c246f890` (v0.0.20).
+   The adapter must never call the wrapper that way, and a test should
+   cover it.
+   Note what this is NOT: a trailing int stage is intended API surface, not
+   a misuse. Upstream's own `generate()` (`:629-636`) calls the wrapper that
+   way on purpose, discards the logits with `_, memories = ...`, and
+   re-derives the seed from `memories.embeds`. Moving the two asserts above
+   the early return therefore breaks 8 of the 46 upstream tests; returning
+   `None` for the logits instead passes all 46. The full report and the
+   verified patch are in `docs/upstream/lucidrains-bdh-cq-stale-logits.md`,
+   drafted but not filed -- this session could not attach the upstream repo
+   with write access.
 5. `update_memory_per_stage` must match the stage count exactly
    (`bdh_cq.py:483-484`).
 6. Memory reuse across a reasoning-step sweep is safe only because
