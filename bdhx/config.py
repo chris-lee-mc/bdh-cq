@@ -130,6 +130,13 @@ class ReasoningCfg(_Base):
 
 class EvaluationCfg(_Base):
     reasoning_steps: list[Int] = [1]
+    # Which R_test values the mid-training checkpoints evaluate, intersected
+    # with `reasoning_steps`. None keeps `evaluate.INTERMEDIATE_REASONING_STEPS`
+    # (1, 4, 16), which is what every run before a4_convergence used. Set it to
+    # include the largest R when the question is WHEN the loop stops settling:
+    # a1_first_experiment could not answer that at R=32 because no mid-training
+    # checkpoint measured R=32 (RESULTS.md, convergence onset).
+    intermediate_reasoning_steps: list[Int] | None = None
     diagnostics: bool = True
     record_adaptation_cost: bool | None = False
 
@@ -212,7 +219,19 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
 # FRAMEWORK_SPEC section 3: "two runs with the same hash and seed are the same
 # experiment", and section 10 groups summary rows by config hash with seed
 # statistics, so the training seed must not enter the hash.
-HASH_EXCLUDED_FIELDS = (("training", "seed"),)
+# `evaluation.intermediate_reasoning_steps` joins it for a different reason:
+# it selects which R_test values the mid-training checkpoints OBSERVE, and
+# observation does not touch the trained model. `run_evaluation` runs under
+# no_grad, restores the previous train/eval mode, resets the context, and draws
+# its episodes from `task_rng(task_seed, split, i)` rather than global RNG, so
+# two runs differing only in this field train identically step for step.
+# Hashing it would have renamed every arm of a1_first_experiment and broken the
+# cell-for-cell identity a4_convergence relies on to reuse A1's plain runs as
+# its reference arm -- a real cost, paid to record a difference that is not one.
+HASH_EXCLUDED_FIELDS = (
+    ("training", "seed"),
+    ("evaluation", "intermediate_reasoning_steps"),
+)
 
 
 def canonical_yaml(cfg: Config) -> str:
