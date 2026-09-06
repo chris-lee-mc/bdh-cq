@@ -567,6 +567,79 @@ does not depend on accuracy at all: raise `cos_last` at R=32 toward 1.0. The
 community `attn_residual` -- whose author states it stabilizes recurrence
 beyond 4 steps -- adds zero parameters and is the cheapest arm to test.
 
+### A1c / A4 pilots (dev, 1 seed, not evidence)
+
+Two go/no-go screens at 8000 steps (20 percent of A1's budget), one seed per
+arm, run to decide whether ~$67 of full sweeps was worth spending. Both are
+tagged `dev` and `DEV`-flagged. Configs `configs/stage_a/a1c_compose_pilot.yaml`
+and `a4_convergence_pilot.yaml`; commit `84c89ce`; 6 jobs, RTX 4090 Secure,
+0.95 GPU-hours of training and about **1.6 GPU-hours / $1.15** billed.
+
+**A1c: no signal, which the design said in advance would be uninformative.**
+
+| model | final train loss | AT_CHANCE | exact match, interp (R=1/4/8/32) |
+|-------|------------------|-----------|----------------------------------|
+| bdh | 8.251 | yes | 0.000 / 0.000 / 0.000 / 0.000 |
+| bdh_cq | 7.905 | no | 0.015 / 0.025 / 0.000 / 0.000 |
+| looped_transformer | 8.331 | yes | 0.000 / 0.000 / 0.000 / 0.000 |
+
+`looped_transformer` sits at exactly ln(vocab) = 8.326, so it did not leave the
+plateau; `bdh_cq` left it slightly and is still an order of magnitude below the
+0.125 guessing floor. Per the pilot's own one-sided framing this **does not**
+fund the full A1c and is **not** evidence that any of the three cannot learn
+`compose`: 8000 steps on a task whose episodes just doubled in length may
+simply be too few. It buys one fact -- nothing here justifies spending $27 yet.
+
+**A4: the pilot refuted its own premise, and that is the finding.**
+
+`cos(H[R], H[R-1])` at the last iteration, `propagate`/`mild`, and accuracy
+beside it:
+
+| kind | final loss | R=1 | R=4 | R=8 | R=32 |
+|------|-----------|-----|-----|-----|------|
+| plain | 0.673 | 0.694 | 0.994 | 0.997 | **1.000** |
+| attn_residual | 0.724 | 0.710 | 1.000 | 1.000 | **1.000** |
+| init_skip | 0.660 | 0.862 | 0.994 | 0.946 | **0.996** |
+
+Token accuracy is 0.66-0.81 and exact match is 0.000 in every cell above.
+
+A1's `plain` arm at 40000 steps sits at **0.74-0.80** at R=32 on this same
+split (section A1b). At 8000 steps it is at **1.000**. So the non-convergence
+A1b diagnosed is **not a property of the update rule**: BDH-CQ's latent loop
+converges perfectly well early in training and *stops* converging somewhere
+between 8000 and 40000 steps. It is acquired, not architectural.
+
+Two consequences:
+
+1. **A4 cannot be screened at 8000 steps.** All three arms already converge, so
+   there is no gap for `attn_residual` or `init_skip` to close and the three
+   are indistinguishable on the metric the sweep exists to move. The full
+   sweep remains the right experiment but must run the full 40000 steps; a
+   short version measures a regime in which the phenomenon does not exist.
+2. **`cos_last` cannot be the primary metric on its own**, and
+   `a4_convergence.yaml`'s argument for it -- that it "measures the learned
+   map's contraction, not its accuracy", so it "needs no bootstrap over a
+   near-zero exact match" -- is wrong. These runs have `cos_last` ~ 1.0 *and*
+   exact match 0.000: the model has not learned `propagate` yet and its loop
+   trivially converges. That is the same signature A1b already flagged on the
+   `strong` split, where BDH-CQ "converges because it has given up". High
+   `cos_last` is confounded with "has not learned the task", so it must be read
+   jointly with accuracy, never instead of it.
+
+The A1b finding itself stands -- at 40000 steps, on the cells it learned,
+BDH-CQ does not converge while the looped Transformer does -- but its
+interpretation narrows: non-convergence is something this architecture
+*develops as it learns the task*, which is a more specific and more
+interesting claim than "the update rule is not contractive".
+
+**Cost note:** the six jobs ran 4.5 to 12.8 minutes each against per-job
+estimates of 12.8 to 94.7 minutes, so `generated/*/estimates.json` (derived
+from A1's manifest) is roughly 6x conservative for training. The full-sweep
+figures quoted below are therefore likely upper bounds, but they are not
+revised here: A1's 72 GPU-hours were dominated by its full evaluation grid
+(6 R values x 1000 episodes) rather than by training, and that grid is
+unchanged in the full sweeps. Profile before trusting a cheaper number.
+
 ### A2. Recurrence curriculum repeat
 
 Pending, and A1b argues it is no longer the right next sweep. A curriculum
@@ -713,6 +786,7 @@ Gate D finding: pending.
 | 2026-09-03 | A | a1_cpu_mini (first version, depth 1, N(0,1) tied head) | none (4 CPU cores) | 0.0 | 0.00 | 9 dev jobs, 1436 s wall clock; superseded, the runs were AT_CHANCE by construction |
 | 2026-09-03 | A | a1_cpu_mini (re-run, depth 2, fixed init) | none (4 CPU cores) | 0.0 | 0.00 | 9 dev jobs, 1299 s wall clock total; pipeline validation only, not evidence; all 9 AT_CHANCE on compose |
 | 2026-09-03 | A | Gate A diagnosis (binding, sanity_learnability + BDH acceptance runs) | none (4 CPU cores) | 0.0 | 0.00 | about 20 CPU jobs of 3000 steps each plus a standalone reference reproduction; see section A0 |
+| 2026-09-06 | A | a1c/a4 pilots (6 jobs, 1 seed, 8000 steps) | RTX 4090, Secure Cloud | ~1.6 | ~1.15 | All 6 exit 0, collected, pods terminated on collection; `get_pods()` confirmed zero remaining. Training wall clock 0.95 GPU-hours; the rest is boot, clone and pip per pod. Came in at a quarter of the $5.27 estimate because A1's profiled per-job minutes are about 6x conservative for training. Findings in section A1c/A4 above: A1c returned no signal (one-sided by design), A4 refuted its own premise and is worth more than the $40 sweep it was screening. |
 | 2026-09-06 | A | a1c/a4 pilot, first attempt (FAILED, no results) | RTX 4090, Secure Cloud | ~12.1 | ~8.93 | 6 pods launched without `--sweep-config-path`. `generated/` is gitignored, so every job died seconds after boot with FileNotFoundError on its own config. A crashed job still tars its output and sleeps, and RunPod keeps a pod allocated after its docker command exits, so all six billed at $0.74/hr until reaped by hand 2.2 hours later. The 90-minute `--max-wall-clock-minutes` cap did not fire: the API returned no `uptimeSeconds` for any of these pods, and watchdog() skipped every pod it could not time. `print_status` showed "$0.000 so far" throughout for the same reason. All three are fixed with regression tests (`tests/test_runpod_launch.py`): the flag is required, watchdog() falls back to the launcher's own `created_at`, and `status` now reports a job that has already exited. Zero science obtained; the pilot itself was not run. |
 | 2026-09-05 | A | A1a task-ceiling audit + A1b convergence diagnosis | none (CPU) | 0.0 | 0.00 | `tools/task_ceiling.py` over all 9 tasks; a checkpoint probe over `bdh_cq`/`propagate` at R = 1..32; re-aggregation of the existing `results/`. No new training: both diagnoses reused the A1 checkpoints and results.json files. |
 | 2026-09-04/05 | A | a1_first_experiment (18 jobs: 3 models x 2 tasks x 3 seeds, ~10M params) | RTX 4090, Secure Cloud | ~72 | ~54 | Estimate = sum of `generated/a1_first_experiment/manifest.csv`'s profiled per-job minutes (49.07 min/job bdh, 364.10 bdh_cq, 306.62 looped_transformer; 71.98 GPU-hours) x $0.74/hr (`configs/runpod_rates.yaml`, RTX 4090 Secure). This undercounts real elapsed wall clock: Community Cloud failed to boot repeatedly (5+ times) before the sweep moved to Secure, one job (`76dd99c62a3e_s1`) alone cycled through 11 distinct pod attempts, and several jobs were relaunched after already reaching their final checkpoint (a bug found and fixed mid-sweep, see Stage A findings) -- but a pod that never boots shows `uptimeSeconds=0` and is not believed to be billed, so those retries are assumed near-$0 rather than added on top. Exceeded the $25 cost gate approved for this sweep; re-approved by explicit user sign-off at ~$32 estimated before the Community-to-Secure switch (which itself raised the per-hour rate from $0.34 to $0.74), so the real total landed higher still. All pods reaped; `runpod status` and a direct `get_pods()` check both confirmed zero pods remaining on the account at sweep end. |

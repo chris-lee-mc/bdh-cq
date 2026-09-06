@@ -8,12 +8,21 @@
 # past R_train_max falls with the rotation.  H7 (EXPERIMENT_PLAN section 3)
 # predicts an initial-state skip fixes that.
 #
-# The primary metric here is `cos_last` at R=32 from
-# recurrence_convergence_propagate.csv, NOT accuracy: it is the direct
-# measurement of the mechanism, it needs no bootstrap over a near-zero exact
-# match, and it is what tells a fixed point apart from a model that has given
-# up (bdh_cq on `strong` converges precisely because it has).  Accuracy at
-# R_test in {4, 8, 32} is the secondary metric.
+# The primary metric is `cos_last` at R=32 from
+# recurrence_convergence_propagate.csv READ JOINTLY WITH accuracy at the same
+# cell -- never on its own.  An earlier version of this comment argued cos_last
+# needed no accuracy beside it since it measures the learned map's contraction
+# rather than its score.  The 8000-step pilot refuted that: all three arms
+# reached cos_last 0.996-1.000 at R=32 while scoring exact match 0.000, because
+# a model that has not learned the task yet has a trivially convergent loop.
+# High cos_last is confounded with "has not learned it", exactly as bdh_cq's
+# `strong` split already showed (RESULTS.md A1b, A1c/A4 pilots).
+#
+# That pilot also established that this sweep CANNOT be shortened.  A1's plain
+# arm sits at 0.74-0.80 at 40000 steps and at 1.000 at 8000: the
+# non-convergence is acquired during training, somewhere between the two, so a
+# reduced-step version measures a regime in which the effect does not exist.
+# Run the full 40000 steps or do not run it.
 #
 # Kinds, and why these three:
 #   attn_residual  the community mechanism, whose author states it stabilizes
