@@ -450,23 +450,46 @@ answer that is absent from its own context, most of the gradient was noise
 pointing at nothing, which is the most likely reason -- but that is a
 hypothesis, and the fixed generator tests it directly.
 
-**Fixed** (`bdhx/tasks/compose.py`): the query's chain is drawn first and every
-pair it passes through is guaranteed to be among the demonstrations, and the
-remaining demonstrations are drawn without replacement so none is spent on a
-duplicate. Episode length, the difficulty ladder and the distractor count are
-unchanged -- at `n_examples_per_fn = 4` of a domain of 8 there are still 3
-distractor pairs per function -- so `depth` now isolates the number of chaining
-hops and nothing else. Oracle solvability is 1.000 at every depth from 1 to 8.
-The pre-fix distribution stays reachable as `ComposeTask(guarantee_solvable=
-False)` so the A1 numbers remain reproducible, and `GENERATOR_VERSION` moves to
-0.2.0 so the aggregator refuses to merge the two.
+**Fixed, in two steps** (`bdhx/tasks/compose.py`). The first fix made the
+query's chain always demonstrated, which restored solvability to 1.000 at every
+depth -- and introduced a second degeneracy that a pre-launch review caught
+before any GPU time was spent on it. Demonstrating the chain plus unrelated
+distractors leaves the distractors dead-ending, so the chain was the **only**
+complete length-d path through the demonstration graph: in 99.4 percent of
+depth-8 episodes the answer could be read off **without looking at the query at
+all**. A task whose answer does not depend on its query is not testing
+composition.
 
-Three tests pin it (`tests/test_tasks_compose.py`):
+So each function is now demonstrated on the *images* of the previous
+function's demonstrated inputs. The graph becomes `n_examples_per_fn` disjoint
+complete paths and the query selects which one; the default is the full
+bijection (`n_examples_per_fn = domain_size = 8`). Measured over 2000 episodes
+per depth, at every depth from 1 to 8: oracle solvable 1.000, unique-path
+(query-redundant) 0.000, endpoints 8.
+
+That also fixes the null. The target is always the end of one of the
+demonstrated paths, so the floor for guessing is **0.125**, flat across depth
+-- not `1/4128 = 0.00024`, and not the 0.25-to-0.06 slide the intermediate
+version had. This matters directly for A1c below, whose go/no-go is "does
+`looped_transformer` leave the ln(vocab) plateau": leaving it is satisfied by
+learning to emit a path endpoint and nothing else, so 0.125 is the line to beat,
+and `tools/task_ceiling.py` now prints it per split.
+
+Cost of the fix: demonstrations go from `4d` pairs to `8d`, so episodes roughly
+double in length. The pre-fix distribution stays reachable as
+`ComposeTask(n_examples_per_fn=4, guarantee_solvable=False)` so the A1 numbers
+remain reproducible, and `generator_version` (now recorded in every run's
+`metadata.json`, not just in cached shards) moves to 0.2.0 so the two can never
+be merged silently.
+
+Five tests pin it (`tests/test_tasks_compose.py`):
 `test_compose_every_episode_is_solvable_from_its_demonstrations`,
+`test_compose_answer_cannot_be_read_off_without_the_query`,
+`test_compose_guess_floor_is_one_over_the_demonstrated_paths`,
 `test_compose_demonstrations_are_distinct_per_function`, and
 `test_compose_legacy_distribution_is_mostly_unsolvable`. The existing
-`test_target_correctness_compose` did not catch this because it checked the
-target against `extras["fns"]` -- the hidden ground truth no model sees --
+`test_target_correctness_compose` did not catch any of it because it checked
+the target against `extras["fns"]` -- the hidden ground truth no model sees --
 rather than against the demonstrations.
 
 `tools/task_ceiling.py` generalizes the check and is a pre-sweep gate

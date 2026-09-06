@@ -14,8 +14,8 @@
 # rest.
 #
 # The plain reference is A1's bdh_cq/propagate seeds, but those are at 40000
-# steps and the full evaluation grid, so the pilot ALSO needs its own plain
-# arm to compare against at 8000 steps.  That is the fourth job.
+# steps and the full evaluation grid, so the pilot carries its own plain arm to
+# compare against at 8000 steps -- 3 arms x 1 seed = 3 jobs.
 sweep:
   name: a4_convergence_pilot
   stage: A

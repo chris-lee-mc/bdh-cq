@@ -310,3 +310,115 @@ def test_at_chance_flag_fires_for_a_flat_run(tmp_path):
     at_chance_rows = [r for r in rows if r["flag"] == "AT_CHANCE"]
     assert [r["config_hash"] for r in at_chance_rows] == ["hashFlat"]
     assert "ln(vocab)" in at_chance_rows[0]["detail"]
+
+
+# -- the A4 sweep: arms that differ only in recurrence.kind -------------------
+
+
+def _write_arm(root, run_id, *, config_hash, seed, kind, step, cos_last, task="propagate"):
+    """One a4_convergence-shaped run: model is always bdh_cq, kind is the arm."""
+    run_dir = root / run_id
+    writer = ResultsWriter(
+        run_dir,
+        run_id=run_id,
+        config_hash=config_hash,
+        seed=seed,
+        model="bdh_cq",
+        task=task,
+        params=10_000_000,
+        status="ok",
+    )
+    writer.add_evaluation(
+        {
+            "step": step,
+            "reasoning_steps": 32,
+            "split": "mild",
+            "difficulty": {"distance": 6},
+            "n_episodes": 200,
+            "exact_match": 0.0,
+            "token_acc": 0.5,
+            "diagnostics": {"cos_consecutive": [0.5, 0.8, cos_last], "nan_count": 0},
+        }
+    )
+    writer.flush()
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "config": {
+                    "experiment": {"name": "a4", "stage": "A", "tags": []},
+                    "model": {"recurrence": {"kind": kind}},
+                    "reasoning": {"train_steps": [1, 2, 4]},
+                },
+                "train_flops_estimate": 1.0e9,
+            }
+        )
+    )
+    return run_dir
+
+
+def test_convergence_rows_keep_recurrence_kinds_apart(tmp_path):
+    """Regression: every a4_convergence arm reports model 'bdh_cq'.
+
+    They differ only in `model.recurrence.kind`, which lives in metadata and not
+    in ResultsFile at all, so a cell key of (model, split, difficulty, R)
+    averaged all three update rules into one row labelled n_seeds=3 -- and that
+    CSV is the pilot's stated primary readout. The three arms must stay
+    separate, with their own cos_last.
+    """
+    from bdhx.results.aggregate import convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    for i, (kind, cos) in enumerate(
+        [("plain", 0.74), ("attn_residual", 0.99), ("init_skip", 0.88)]
+    ):
+        _write_arm(
+            root, f"h{i}_s1", config_hash=f"h{i}", seed=1, kind=kind, step=8000, cos_last=cos
+        )
+
+    rows = convergence_rows(walk_runs(root), "propagate")
+    by_kind = {r["recurrence_kind"]: r for r in rows}
+    assert set(by_kind) == {"plain", "attn_residual", "init_skip"}
+    assert all(r["n_seeds"] == 1 for r in rows)
+    assert by_kind["attn_residual"]["cos_last"] == pytest.approx(0.99)
+    assert by_kind["plain"]["cos_last"] == pytest.approx(0.74)
+    assert {r["arm"] for r in rows} == {
+        "bdh_cq/plain",
+        "bdh_cq/attn_residual",
+        "bdh_cq/init_skip",
+    }
+
+
+def test_convergence_rows_keep_a_run_that_stopped_early(tmp_path):
+    """Regression: `final_step` was the max over ALL runs, so a short run vanished.
+
+    The pilots cap wall clock at 90 minutes against an 80.1-minute estimate and
+    `Trainer` stops on that deadline, so an overrunning job's final evaluation
+    lands below the nominal step count. Under a global max it produced no row at
+    all -- not a smaller n_seeds, no warning.
+    """
+    from bdhx.results.aggregate import convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_arm(root, "h0_s1", config_hash="h0", seed=1, kind="plain", step=8000, cos_last=0.74)
+    _write_arm(root, "h1_s1", config_hash="h1", seed=1, kind="init_skip", step=7400, cos_last=0.95)
+
+    kinds = {r["recurrence_kind"] for r in convergence_rows(walk_runs(root), "propagate")}
+    assert kinds == {"plain", "init_skip"}
+
+
+def test_diagnostic_series_are_written_per_arm(tmp_path):
+    """The per-iteration CSVs were also keyed on the model name alone."""
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_arm(root, "h0_s1", config_hash="h0", seed=1, kind="plain", step=8000, cos_last=0.74)
+    _write_arm(root, "h1_s1", config_hash="h1", seed=1, kind="init_skip", step=8000, cos_last=0.95)
+
+    out = tmp_path / "report"
+    aggregate(root, out)
+    assert (out / "cos_consecutive_vs_iteration_bdh_cq_plain_propagate.csv").exists()
+    assert (out / "cos_consecutive_vs_iteration_bdh_cq_init_skip_propagate.csv").exists()
+    with open(out / "cos_consecutive_vs_iteration_bdh_cq_plain_propagate.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows and {"config_hash", "recurrence_kind", "split", "reasoning_steps"} <= set(rows[0])

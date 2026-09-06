@@ -8,6 +8,11 @@
 # A1a shows 71 percent of its training episodes had an answer that was absent
 # from their own context.
 #
+# The bar is the guessing floor, 0.125, NOT ln(vocab).  compose hands back one
+# of 8 demonstrated path endpoints, so a model that learns only "emit a path
+# endpoint" already leaves the 8.326 plateau.  Read the loss against 0.125's
+# implied cross-entropy, and the accuracy against 0.125.
+#
 # Read as a ONE-SIDED test.  Leaving the plateau at 8000 steps is decisive and
 # funds the full sweep; still sitting on it at 8000 steps is not, because
 # 8000 steps may simply be too few.  The training loss curve in train_log.csv

@@ -14,29 +14,53 @@ from bdhx.tasks.vocab import COMPOSE, draw_symbols
 class ComposeTask(EpisodicTask):
     """Compose d random bijections over disjoint domains; query applies all d in order.
 
-    Every episode is solvable from its own demonstrations: the d pairs the
-    query's chain passes through are always demonstrated (`guarantee_solvable`),
-    and the remaining pairs of each function are drawn without replacement so no
-    demonstration is wasted on a duplicate.  Without that guarantee the answer
-    is derivable in only `(1 - (1 - 1/domain_size) ** n_examples_per_fn) ** d`
-    of episodes -- 0.41 at depth 1 and 0.001 at depth 8 for the defaults -- and
-    in the rest the target token does not appear in the episode at all, so no
-    model can do better than guess over the whole symbol pool.  See
-    `RESULTS.md` section A1 for the measurement that motivated the guarantee.
+    Two properties the generator must have for `depth` to isolate chaining, and
+    both had to be fixed to get them (`RESULTS.md` section A1a):
+
+    1. Solvable. The d pairs the query's chain passes through are always
+       demonstrated. Without that the answer is derivable in only
+       `(1 - (1 - 1/domain_size) ** n_examples_per_fn) ** d` of episodes --
+       0.41 at depth 1 and 0.001 at depth 8 with 4 examples of a domain of 8 --
+       and in the rest the target token appears nowhere in the episode, so no
+       model can do better than guess over the whole 4096-symbol pool.
+    2. Query-dependent. Demonstrating each function on the chain input plus
+       unrelated distractors is solvable but degenerate: the distractors dead
+       end, so the chain is the ONLY complete length-d path through the demo
+       graph and the answer can be read off without looking at the query at
+       all -- in 99.4 percent of depth-8 episodes, measured. Instead each
+       function is demonstrated on the IMAGES of the previous function's
+       demonstrated inputs, so the demo graph is `n_examples_per_fn` disjoint
+       complete paths and the query selects which one. At the default
+       `n_examples_per_fn = domain_size` the full bijection is shown, which
+       also fixes the guessing floor at `1/domain_size` (0.125) for every
+       depth rather than letting it drift with the number of reachable
+       endpoints.
     """
 
     name = "compose"
 
     def __init__(
         self,
-        n_examples_per_fn: int = 4,
+        n_examples_per_fn: int | None = None,
         domain_size: int = 8,
         guarantee_solvable: bool = True,
     ) -> None:
-        self.n_examples_per_fn = n_examples_per_fn
+        # None means "the whole domain": every function fully demonstrated.
+        self.n_examples_per_fn = domain_size if n_examples_per_fn is None else n_examples_per_fn
         self.domain_size = domain_size
         # False reproduces the pre-fix distribution of the A1 sweep.
         self.guarantee_solvable = guarantee_solvable
+
+    def guess_floor(self, depth: int) -> float:
+        """Exact match from guessing uniformly among the reachable endpoints.
+
+        The null this task is scored against. It is NOT 1/vocab: the target is
+        always the end of one of the `n_examples_per_fn` demonstrated paths, so
+        a model that learns only "emit a path endpoint" already scores this.
+        """
+        if not self.guarantee_solvable:
+            return 0.0
+        return 1.0 / max(min(self.n_examples_per_fn, self.domain_size), 1)
 
     def train_difficulties(self) -> list[dict[str, int]]:
         return [{"depth": d} for d in (1, 2)]
@@ -78,12 +102,21 @@ class ComposeTask(EpisodicTask):
         x, target_val = intermediates[0], intermediates[-1]
 
         demonstrations: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # `demoed` is the index set of domains[i] that f_i is demonstrated on.
+        # It starts as the chain's input plus distractors, and every later
+        # function is demonstrated on the IMAGES of the previous one's, so each
+        # demonstrated edge continues and the graph is `n_examples` disjoint
+        # complete paths rather than one chain among dead ends.
+        demoed = self._demo_indices(rng, domain_size, n_examples, chain_idx[0])
         for i in range(d):
-            idxs = self._demo_indices(rng, domain_size, n_examples, chain_idx[i])
-            for j in idxs:
+            if not self.guarantee_solvable and i:
+                demoed = self._demo_indices(rng, domain_size, n_examples, chain_idx[i])
+            for j in demoed:
                 demonstrations.append(
                     (torch.tensor([int(domains[i][j])]), torch.tensor([int(fns[i][j])]))
                 )
+            if i + 1 < d:
+                demoed = self._continue(demoed, domains[i + 1], fns[i])
         rng.shuffle(demonstrations)  # order does not carry function identity
 
         query = torch.tensor([COMPOSE, d, x])
@@ -102,17 +135,29 @@ class ComposeTask(EpisodicTask):
     def _demo_indices(
         self, rng: np.random.Generator, domain_size: int, n_examples: int, chain: int
     ) -> np.ndarray:
-        """Which inputs of one function to demonstrate.
+        """Which inputs of the FIRST function to demonstrate.
 
         With the guarantee, the chain's own input is always among them and the
-        rest are distinct distractors; without it, the legacy draw is with
-        replacement and may miss the chain entirely.
+        rest are distinct; without it, the legacy draw is with replacement over
+        every function independently and may miss the chain entirely.
         """
         if not self.guarantee_solvable:
             return rng.integers(0, domain_size, size=n_examples)
         others = np.array([j for j in range(domain_size) if j != chain])
         extra = rng.choice(others, size=n_examples - 1, replace=False)
         return np.concatenate(([chain], extra)).astype(int)
+
+    @staticmethod
+    def _continue(demoed: np.ndarray, next_domain: np.ndarray, fn: np.ndarray) -> np.ndarray:
+        """Indices in `next_domain` of the values `fn` maps `demoed` to.
+
+        Carrying the demonstrated set forward this way is what makes the query
+        matter: every demonstrated edge has a demonstrated successor, so there
+        are as many complete paths as demonstrations per function and the model
+        has to follow the one the query starts.
+        """
+        position = {int(v): j for j, v in enumerate(next_domain)}
+        return np.array([position[int(fn[j])] for j in demoed], dtype=int)
 
     def score(self, prediction: torch.Tensor, episode: Episode) -> dict[str, float]:
         scores = self.base_score(prediction, episode)

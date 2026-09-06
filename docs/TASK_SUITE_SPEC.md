@@ -160,16 +160,31 @@ symbol tokens; `->` denotes a demonstration pair.
   episode is answerable from its own demonstrations at every depth. This is
   not optional polish. Without it the answer is derivable in only
   `(1 - (1 - 1/domain_size) ** n_examples_per_fn) ** d` of episodes -- 0.41 at
-  depth 1 and 0.001 at depth 8 for the defaults -- and in the rest the target
-  is a symbol that appears nowhere in the episode, so Bayes-optimal exact
-  match on the `strong` split is 0.03 and no result on the task can clear the
-  0.05 credibility bar of `EXPERIMENT_PLAN` section 9. That was the shipped
-  behaviour through the A1 sweep; see `RESULTS.md` section A1a for the
-  measurement, and `tools/task_ceiling.py` for the pre-sweep gate that now
-  catches it. `ComposeTask(guarantee_solvable=False)` reproduces the old
-  distribution for reproducing A1.
-- Knobs: `depth` d in {1, 2, 3, 4, 6, 8}; `n_examples_per_fn` (clamped to
-  `domain_size`, since the draw is without replacement); `domain_size`.
+  depth 1 and 0.001 at depth 8 with 4 examples of a domain of 8 -- and in the
+  rest the target is a symbol that appears nowhere in the episode, so
+  Bayes-optimal exact match on the `strong` split is 0.03 and no result on the
+  task can clear the 0.05 credibility bar of `EXPERIMENT_PLAN` section 9. That
+  was the shipped behaviour through the A1 sweep; see `RESULTS.md` section A1a
+  for the measurement, and `tools/task_ceiling.py` for the pre-sweep gate that
+  now catches it. `ComposeTask(guarantee_solvable=False)` reproduces the old
+  distribution.
+- Query-dependence (REQUIRED): each function is demonstrated on the IMAGES of
+  the previous function's demonstrated inputs, so the demonstration graph is
+  `n_examples_per_fn` disjoint complete paths and the query selects which one.
+  Solvability alone is not enough: demonstrating the chain plus unrelated
+  distractors leaves the distractors dead-ending, so the chain is the only
+  complete length-d path and the answer can be read off without looking at the
+  query -- true in 99.4 percent of depth-8 episodes when that was first
+  measured. A task whose answer does not depend on its query is not testing
+  composition.
+- Guessing floor: the target is always the end of one of the demonstrated
+  paths, so the null is `1/n_examples_per_fn` (0.125 at the defaults), NOT
+  `1/vocab`. `tools/task_ceiling.py` reports it per split and every table that
+  scores this task must quote it, since "left the ln(vocab) plateau" is
+  satisfied by learning to emit a path endpoint and nothing else.
+- Knobs: `depth` d in {1, 2, 3, 4, 6, 8}; `n_examples_per_fn` (default: the
+  whole domain, i.e. the full bijection is shown; clamped to `domain_size`,
+  since the draw is without replacement); `domain_size`.
 - Train: depth {1, 2}. Interp: {1, 2}. Mild: {3, 4}. Strong: {6, 8}.
 - Metric: exact match vs depth; `partial_depth_acc` (largest prefix depth
   whose intermediate result would have been correct, reconstructed from

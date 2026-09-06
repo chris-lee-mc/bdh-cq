@@ -481,6 +481,9 @@ FLAGS_COLUMNS = ("flag", "config_hash", "model", "task", "detail")
 
 CONVERGENCE_COLUMNS = (
     "model",
+    "arm",
+    "config_hash",
+    "recurrence_kind",
     "task",
     "split",
     "difficulty",
@@ -491,6 +494,24 @@ CONVERGENCE_COLUMNS = (
     "token_acc",
     "exact_match",
 )
+
+
+def recurrence_kind(rec: RunRecord) -> str:
+    cfg = (rec.metadata or {}).get("config") or {}
+    return str(((cfg.get("model") or {}).get("recurrence") or {}).get("kind", ""))
+
+
+def arm_label(rec: RunRecord) -> str:
+    """What distinguishes one sweep arm from another in a plot legend.
+
+    `results.model` is `cfg.model.name`, which is "bdh_cq" for EVERY arm of
+    a4_convergence -- they differ only in `model.recurrence.kind`. Keying a
+    table or a plot on the model name alone silently averages the update rules
+    together and labels the result n_seeds=3, which is exactly the number the
+    sweep is meant to compare.
+    """
+    kind = recurrence_kind(rec)
+    return f"{rec.results.model}/{kind}" if kind else rec.results.model
 
 
 def mean(values) -> float:
@@ -508,13 +529,16 @@ def convergence_rows(records: list[RunRecord], task: str) -> list[dict[str, Any]
     asks for and the pooled per-iteration plots cannot support.
     """
     cells: dict[tuple, list[dict[str, float]]] = {}
-    final_step = max(
-        (ev.step for rec in records if rec.results.task == task for ev in rec.results.evaluations),
-        default=0,
-    )
     for rec in records:
         if rec.results.task != task:
             continue
+        # Per run, not global. A global max silently DROPS every run that
+        # stopped short of it -- no row, no smaller n_seeds, no warning. That
+        # is live risk, not theory: the pilots cap wall clock at 90 minutes
+        # against an 80.1-minute estimate, and `Trainer` stops on that
+        # deadline, so an overrunning job's final eval lands at e.g. 7400
+        # steps instead of 8000 and the whole arm vanishes from this table.
+        final_step = max((ev.step for ev in rec.results.evaluations), default=0)
         for ev in rec.results.evaluations:
             if ev.step != final_step or ev.diagnostics is None:
                 continue
@@ -523,6 +547,9 @@ def convergence_rows(records: list[RunRecord], task: str) -> list[dict[str, Any]
                 continue
             key = (
                 rec.results.model,
+                arm_label(rec),
+                rec.results.config_hash,
+                recurrence_kind(rec),
                 ev.split,
                 _difficulty_key(ev.difficulty),
                 ev.reasoning_steps,
@@ -538,10 +565,13 @@ def convergence_rows(records: list[RunRecord], task: str) -> list[dict[str, Any]
                 }
             )
     rows = []
-    for (model, split, difficulty, r), seeds in sorted(cells.items()):
+    for (model, arm, config_hash, kind, split, difficulty, r), seeds in sorted(cells.items()):
         rows.append(
             {
                 "model": model,
+                "arm": arm,
+                "config_hash": config_hash,
+                "recurrence_kind": kind,
                 "task": task,
                 "split": split,
                 "difficulty": difficulty,
@@ -752,27 +782,39 @@ def make_plots(
         paths.append(path)
 
     # 6. state_norm_vs_iteration_<model>_<task>.png (+ update_norm/cos companions)
-    model_task_pairs = sorted({(rec.results.model, rec.results.task) for rec in usable})
+    # Grouped by ARM, not by model name: every arm of a4_convergence reports
+    # `model: bdh_cq` and differs only in `model.recurrence.kind`, so grouping
+    # on the model name writes one file per task with all the update rules
+    # pooled into it -- the same mistake, one level up, as the unlabelled
+    # series below.
+    arm_task_pairs = sorted({(arm_label(rec), rec.results.task) for rec in usable})
     diag_names = ("state_norm", "update_norm", "cos_consecutive")
-    if not model_task_pairs:
+    if not arm_task_pairs:
         path = out_dir / "state_norm_vs_iteration.png"
         _empty_plot(path, "state_norm vs iteration")
         paths.append(path)
-    for model, task in model_task_pairs:
+    for arm, task in arm_task_pairs:
+        slug = arm.replace("/", "_")
         # Each series is labelled with the cell it came from. Unlabelled series
         # pooled every checkpoint, split, difficulty and R_test into one picture,
         # which is how the A1 write-up first read a converging curve off cells
         # that do not converge (`RESULTS.md` section A1).
         series_by_diag: dict[str, list[tuple[dict, list[float]]]] = {n: [] for n in diag_names}
         for rec in usable:
-            if rec.results.model != model or rec.results.task != task:
+            if arm_label(rec) != arm or rec.results.task != task:
                 continue
+            # Per run: a run that stopped short of the sweep's longest run must
+            # still contribute its own final checkpoint (see convergence_rows).
+            run_final_step = max((ev.step for ev in rec.results.evaluations), default=0)
             for ev in rec.results.evaluations:
                 if ev.diagnostics is None:
                     continue
                 label = {
                     "seed": rec.results.seed,
+                    "config_hash": rec.results.config_hash,
+                    "recurrence_kind": recurrence_kind(rec),
                     "step": ev.step,
+                    "is_final_step": ev.step == run_final_step,
                     "reasoning_steps": ev.reasoning_steps,
                     "split": ev.split,
                     "difficulty": _difficulty_key(ev.difficulty),
@@ -781,31 +823,27 @@ def make_plots(
                     values = getattr(ev.diagnostics, name)
                     if values:
                         series_by_diag[name].append((label, values))
-        final_step = max(
-            (label["step"] for series in series_by_diag.values() for label, _ in series),
-            default=0,
-        )
         for name in diag_names:
-            fname = f"{name}_vs_iteration_{model}_{task}.png"
+            fname = f"{name}_vs_iteration_{slug}_{task}.png"
             path = out_dir / fname
             series = series_by_diag[name]
-            plotted = [(lab, v) for lab, v in series if lab["step"] == final_step]
+            plotted = [(lab, v) for lab, v in series if lab["is_final_step"]]
             if not plotted:
-                _empty_plot(path, f"{name} vs iteration ({model}/{task})")
+                _empty_plot(path, f"{name} vs iteration ({arm}/{task})")
             else:
                 fig, ax = plt.subplots()
                 for i, (_, vals) in enumerate(plotted):
                     ax.plot(range(len(vals)), vals, alpha=0.6, label=None if i else name)
                 ax.set_xlabel("iteration")
                 ax.set_ylabel(name)
-                ax.set_title(f"{name} vs iteration ({model}/{task}, step {final_step})")
+                ax.set_title(f"{name} vs iteration ({arm}/{task}, final checkpoint)")
                 _save(fig, path)
             rows = [
                 {**label, "iteration": i, name: v}
                 for label, vals in series
                 for i, v in enumerate(vals)
             ]
-            write_csv(rows or [{}], out_dir / f"{name}_vs_iteration_{model}_{task}.csv")
+            write_csv(rows or [{}], out_dir / f"{name}_vs_iteration_{slug}_{task}.csv")
             paths.append(path)
 
     # 7. recurrence_convergence_<task>.png: does the latent reach a fixed point?

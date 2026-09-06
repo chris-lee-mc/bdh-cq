@@ -253,6 +253,37 @@ def latest_state_by_run_id(state_path: Path = DEFAULT_STATE_FILE) -> dict[str, d
 DEFAULT_HTTP_PORT = 8888
 
 
+def require_sweep_config_path(sweep_config_path: str) -> str:
+    """Every path that creates a pod goes through this.
+
+    generated/ is gitignored, so a pod's fresh clone never has the expanded
+    exp_NNN.yaml on disk; build_docker_args() regenerates it from the source
+    sweep YAML, and only when this is set. Launching without it fails every
+    job seconds after boot with FileNotFoundError -- and because a crashed job
+    still tars its output and sleeps, and RunPod keeps a pod allocated after
+    its docker command exits, the pods bill on regardless. That cost ~$8.93
+    once (RESULTS.md compute ledger, 2026-09-06).
+
+    `launch()` validated its own argument, but `relaunch()` builds PodRecords
+    straight from the state file and calls create_pod() itself, so it
+    inherited nothing -- and the state file still holds pre-guard rows with
+    the field empty, which made the burn one `relaunch` command away from
+    happening again.
+    """
+    if not sweep_config_path:
+        raise ValueError(
+            "sweep_config_path is required: generated/ is gitignored, so the "
+            "pod regenerates exp_NNN.yaml from the source sweep YAML"
+        )
+    if not (PROJECT_ROOT / sweep_config_path).exists():
+        raise ValueError(
+            f"sweep_config_path {sweep_config_path!r} does not exist in the repo; "
+            "the pod resolves it relative to its own clone, so it must be a "
+            "committed path"
+        )
+    return sweep_config_path
+
+
 def build_docker_args(
     cfg: PodRecord,
     git_ref: str,
@@ -303,13 +334,15 @@ def build_docker_args(
     # runs from the same commit produce byte-identical output), so
     # regenerating it on the pod reproduces the same exp_NNN.yaml files
     # rather than needing to transfer them.
-    regen = ""
-    if cfg.sweep_config_path:
-        sweep_out_dir = os.path.dirname(cfg.config_path)
-        regen = (
-            f"python tools/generate_sweep.py {cfg.sweep_config_path} "
-            f"--out {sweep_out_dir} --max-gpu-hours 1e9; "
-        )
+    # Raise rather than emit a command without the regen step: a PodRecord with
+    # no sweep_config_path is never one you want to launch, and quietly dropping
+    # regen is exactly how the burn happened.
+    require_sweep_config_path(cfg.sweep_config_path)
+    sweep_out_dir = os.path.dirname(cfg.config_path)
+    regen = (
+        f"python tools/generate_sweep.py {cfg.sweep_config_path} "
+        f"--out {sweep_out_dir} --max-gpu-hours 1e9 && "
+    )
     return (
         "bash -lc '"
         "set -uo pipefail; "
@@ -420,21 +453,7 @@ def launch(
     if client is None:
         client = _default_client()
 
-    # Checked here rather than only in the CLI so `relaunch` and any other
-    # caller get the same guard. The failure this prevents is silent and
-    # expensive: the job crashes seconds after boot, the pod tars its output
-    # and sleeps, and billing continues until a reap.
-    if not sweep_config_path:
-        raise ValueError(
-            "sweep_config_path is required: generated/ is gitignored, so the "
-            "pod regenerates exp_NNN.yaml from the source sweep YAML"
-        )
-    if not (PROJECT_ROOT / sweep_config_path).exists():
-        raise ValueError(
-            f"sweep_config_path {sweep_config_path!r} does not exist in the repo; "
-            "the pod resolves it relative to its own clone, so it must be a "
-            "committed path"
-        )
+    require_sweep_config_path(sweep_config_path)
 
     generated_dir = Path(generated_dir)
     sweep = generated_dir.name
@@ -538,6 +557,11 @@ def status(
     if client is None:
         client = _default_client()
 
+    try:
+        live_ids = {p.get("id") for p in client.get_pods()}
+    except Exception:  # noqa: BLE001 - no listing means we cannot tell gone from unreachable
+        live_ids = None
+
     rows = []
     for rec in latest_state_by_run_id(state_path).values():
         if rec.get("done"):
@@ -555,11 +579,26 @@ def status(
             continue
         try:
             pod = client.get_pod(rec["pod_id"])
-        except Exception:  # noqa: BLE001 - a not-found pod means MISSING, not a crash
+        except Exception:  # noqa: BLE001 - could be "not found", could be the API
             pod = None
-        row = {**rec, "state": classify(pod), "pod": pod}
+        # `get_pod` failing is ambiguous: the pod may be gone, or the API may be
+        # having a moment. The account-wide listing disambiguates -- an id
+        # absent from a listing that itself succeeded really is gone.
+        unreachable = pod is None and live_ids is None
+        # A transient API error is indistinguishable from a terminated pod at
+        # this layer, and calling it MISSING made relaunch() create a SECOND pod
+        # for the same run_id -- whose new state row then erased the original's
+        # pod_id, leaving a live pod that watchdog, status, collect and
+        # reap_stuck_boots can no longer see and only `reap --prefix` can find.
+        # UNKNOWN is excluded from relaunch, so the worst case is a retry
+        # deferred by one poll rather than a pod nobody is tracking.
+        state = "UNKNOWN" if unreachable else classify(pod)
+        row = {**rec, "state": state, "pod": pod}
         if row["state"] == "RUNNING" and check_exit_codes:
-            row["exit_code"] = job_exit_code(rec["pod_id"], rec["run_id"], fetch=fetch)
+            try:
+                row["exit_code"] = job_exit_code(rec["pod_id"], rec["run_id"], fetch=fetch)
+            except Exception:  # noqa: BLE001 - one pod must not empty the table
+                row["exit_code"] = None
         rows.append(row)
     return rows
 
@@ -594,9 +633,15 @@ def relaunch(
     state_path: Path = DEFAULT_STATE_FILE,
     client=None,
     s3_bucket: str | None = None,
+    sweep_config_path: str = "",
 ) -> list[PodRecord]:
     if client is None:
         client = _default_client()
+
+    # State rows written before this guard existed carry an empty
+    # sweep_config_path; an explicit argument overrides whatever the row says,
+    # and the row is only trusted once it validates.
+    require_sweep_config_path(sweep_config_path or "")
 
     sweep = Path(generated_dir).name
     # Scoped to this sweep: an unfiltered state file mixes in unrelated runs
@@ -622,7 +667,7 @@ def relaunch(
             max_seconds=r.get("max_seconds", max_seconds),
             config_path=r["config_path"],
             name=r.get("name", f"bdhx-{r['sweep']}-{r['exp']}"),
-            sweep_config_path=r.get("sweep_config_path", ""),
+            sweep_config_path=sweep_config_path,
         )
         docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
         try:
@@ -828,7 +873,10 @@ def _http_text(url: str, timeout: int = 20) -> str | None:
             timeout=timeout + 10,
             check=False,
         )
-    except subprocess.SubprocessError:
+    except (subprocess.SubprocessError, OSError):
+        # OSError covers a missing curl binary (FileNotFoundError) and a failed
+        # fork. Letting either escape emptied the whole `status` table -- the
+        # one place a runaway pod is meant to be visible -- while pods billed.
         return None
     return result.stdout if result.returncode == 0 else None
 
@@ -976,6 +1024,14 @@ def main(argv: list[str] | None = None) -> int:
     p_relaunch.add_argument("--git-ref", required=True)
     p_relaunch.add_argument("--max-concurrent", type=int, default=6)
     p_relaunch.add_argument("--s3-bucket", default=None)
+    p_relaunch.add_argument(
+        "--sweep-config-path",
+        required=True,
+        help="same source YAML `launch` was given; required for the same "
+        "reason, and NOT read back from the state file, which still holds "
+        "pre-guard rows with the field empty",
+    )
+    p_relaunch.add_argument("--max-wall-clock-minutes", type=int, default=180)
 
     sub.add_parser("watchdog")
 
@@ -1031,7 +1087,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.generated_dir,
             args.git_ref,
             max_concurrent=args.max_concurrent,
+            max_wall_clock_minutes=args.max_wall_clock_minutes,
             s3_bucket=args.s3_bucket,
+            sweep_config_path=args.sweep_config_path,
         )
         print(f"relaunched {len(r)} jobs")
     elif args.cmd == "watchdog":

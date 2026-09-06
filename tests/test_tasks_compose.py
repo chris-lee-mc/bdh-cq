@@ -221,8 +221,12 @@ def test_compose_demonstrations_are_distinct_per_function():
 
 
 def test_compose_legacy_distribution_is_mostly_unsolvable():
-    """The pre-fix generator, kept behind a flag, and why the flag defaults to on."""
-    task = ComposeTask(guarantee_solvable=False)
+    """The pre-fix generator, kept behind a flag, and why the flag defaults to on.
+
+    A1's parameters explicitly: 4 examples of a domain of 8, drawn with
+    replacement per function, query drawn independently.
+    """
+    task = ComposeTask(n_examples_per_fn=4, domain_size=8, guarantee_solvable=False)
     rng = np.random.default_rng(23)
     solved = sum(
         _chain_from_demonstrations(task.sample(rng, {"depth": 2})) is not None for _ in range(500)
@@ -311,3 +315,57 @@ def test_nested_program_uses_five_primitives():
         ep = task.sample(rng, {"depth": 3})
         seen.update(ep.extras["program"])
     assert seen == set(PRIMITIVES.keys())
+
+
+# -- query-dependence (RESULTS.md A1a, finding 5 of the pre-launch review) ----
+
+
+def _complete_paths(episode):
+    """Every length-d path through the demonstration graph, from any start."""
+    demo = {int(inp[0]): int(out[0]) for inp, out in episode.demonstrations}
+    depth = int(episode.difficulty["depth"])
+    starts = set(demo) - set(demo.values())
+    paths = []
+    for start in starts:
+        cur, ok = start, True
+        for _ in range(depth):
+            if cur not in demo:
+                ok = False
+                break
+            cur = demo[cur]
+        if ok:
+            paths.append(cur)
+    return paths
+
+
+def test_compose_answer_cannot_be_read_off_without_the_query():
+    """Regression: the first `guarantee_solvable` made the query redundant.
+
+    Demonstrating each function on the chain input plus unrelated distractors
+    leaves the distractors dead-ending, so the chain was the only complete
+    length-d path -- unique in 99.4 percent of depth-8 episodes, so a model
+    could emit the answer without reading x at all. Each function is now
+    demonstrated on the images of the previous one's inputs, so there are as
+    many complete paths as demonstrations per function.
+    """
+    task = ComposeTask()
+    rng = np.random.default_rng(31)
+    for depth in (1, 2, 4, 8):
+        for _ in range(20):
+            ep = task.sample(rng, {"depth": depth})
+            paths = _complete_paths(ep)
+            assert len(paths) == task.n_examples_per_fn, (depth, len(paths))
+            assert int(ep.target[0]) in paths
+
+
+def test_compose_guess_floor_is_one_over_the_demonstrated_paths():
+    """The null to score against, and it is not 1/vocab."""
+    task = ComposeTask()
+    assert task.guess_floor(8) == pytest.approx(1.0 / 8)
+    assert ComposeTask(n_examples_per_fn=4).guess_floor(8) == pytest.approx(0.25)
+    rng = np.random.default_rng(37)
+    for depth in (1, 8):
+        endpoints = {
+            len(set(_complete_paths(task.sample(rng, {"depth": depth})))) for _ in range(50)
+        }
+        assert endpoints == {task.n_examples_per_fn}

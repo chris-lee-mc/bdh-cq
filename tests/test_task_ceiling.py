@@ -26,7 +26,7 @@ def test_compose_oracle_matches_the_target_after_the_fix():
 
 def test_compose_measure_reports_the_legacy_ceiling():
     """The pre-fix generator is what the gate exists to catch."""
-    legacy = ComposeTask(guarantee_solvable=False)
+    legacy = ComposeTask(n_examples_per_fn=4, domain_size=8, guarantee_solvable=False)
     stats = task_ceiling.measure(legacy, {"depth": 2}, n=400, seed=5)
     assert stats["oracle_solvable"] < 0.3  # analytic 0.171
     fixed = task_ceiling.measure(ComposeTask(), {"depth": 2}, n=100, seed=5)
@@ -51,7 +51,9 @@ def test_gate_passes_on_the_fixed_generator(capsys):
 
 def test_gate_fails_when_a_train_difficulty_is_unanswerable(monkeypatch, capsys):
     monkeypatch.setattr(
-        task_ceiling, "get_task", lambda name: lambda: ComposeTask(guarantee_solvable=False)
+        task_ceiling,
+        "get_task",
+        lambda name: lambda: ComposeTask(n_examples_per_fn=4, guarantee_solvable=False),
     )
     assert (
         task_ceiling.main(["--task", "compose", "--episodes", "200", "--min-train-solvable", "0.9"])

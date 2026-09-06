@@ -29,6 +29,9 @@ def record() -> PodRecord:
         max_seconds=600,
         config_path="generated/toy_sweep/exp_000.yaml",
         name="bdhx-toy_sweep-exp_000",
+        # build_docker_args refuses a record without one: a pod's clone has no
+        # generated/, so it regenerates the sweep from this committed path.
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
     )
 
 

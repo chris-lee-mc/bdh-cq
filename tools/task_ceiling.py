@@ -13,6 +13,12 @@ Two checks, both cheap and both purely properties of the generator:
    episodes whose answer can actually be DERIVED from the demonstrations. This
    is stricter than (1): a target can be visible without being identifiable.
 
+3. Guess floor, where the task defines one: the exact match a model scores by
+   learning the shape of the answer and nothing else. Quoting `1/vocab` as the
+   null is wrong whenever the target is drawn from a small in-context set --
+   `compose` hands back one of 8 demonstrated path endpoints, so its null is
+   0.125, not 0.00024. A result is only interesting above this line.
+
 The `AT_CHANCE` flag (`bdhx/results/aggregate.py`) catches a run that learned
 nothing. This catches the other half of the same problem: a task that could not
 have been learned. `compose` shipped with an oracle-solvable rate of 0.41 at
@@ -87,9 +93,11 @@ def measure(task, difficulty: dict, n: int, seed: int) -> dict[str, float | None
         in_context += all(t in tokens for t in target if is_symbol(t))
         if oracle is not None:
             solvable += oracle(episode) == target[0]
+    floor = getattr(task, "guess_floor", None)
     return {
         "target_in_context": in_context / n,
         "oracle_solvable": (solvable / n) if oracle is not None else None,
+        "guess_floor": floor(int(difficulty.get("depth", 0))) if callable(floor) else None,
     }
 
 
@@ -108,13 +116,21 @@ def report(name: str, n: int, seed: int, min_train_solvable: float) -> bool:
         f"\n=== {name} ({n} episodes per difficulty, "
         f"{'oracle registered' if has_oracle else 'no oracle: in-context bound only'}) ==="
     )
-    print(f"{'split':8s} {'difficulty':46s} {'target in ctx':>13s} {'oracle solvable':>16s}")
+    print(
+        f"{'split':8s} {'difficulty':46s} {'target in ctx':>13s} "
+        f"{'oracle solvable':>16s} {'guess floor':>12s}"
+    )
     ok = True
     for split, difficulty in difficulties_for(task):
         stats = measure(task, difficulty, n, seed)
         solvable = stats["oracle_solvable"]
         shown = "-" if solvable is None else f"{solvable:.3f}"
-        print(f"{split:8s} {difficulty!s:46s} {stats['target_in_context']:13.3f} {shown:>16s}")
+        floor = stats["guess_floor"]
+        floor_shown = "-" if floor is None else f"{floor:.3f}"
+        print(
+            f"{split:8s} {difficulty!s:46s} {stats['target_in_context']:13.3f} "
+            f"{shown:>16s} {floor_shown:>12s}"
+        )
         bound = stats["target_in_context"] if solvable is None else solvable
         if split == "train" and bound < min_train_solvable:
             ok = False

@@ -272,7 +272,14 @@ def test_relaunch_survives_one_create_pod_failure(tmp_path):
         return real_create_pod(**kwargs)
 
     client.create_pod = flaky_create_pod
-    relaunched = relaunch(d, git_ref="x", max_concurrent=2, state_path=state_path, client=client)
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(relaunched) == 1  # first attempt failed and was skipped, not raised
     rows = status(state_path, client=client)
     states = {r["run_id"]: r["state"] for r in rows}
@@ -349,6 +356,7 @@ def test_docker_args_never_contains_api_key():
         cloud_type="COMMUNITY",
         max_seconds=100,
         config_path="cfg.yaml",
+        sweep_config_path=SWEEP_YAML,
     )
     args = build_docker_args(rec, "deadbeef")
     assert "RUNPOD_API_KEY" not in args
@@ -378,6 +386,7 @@ def test_docker_args_checks_out_fetch_head_not_the_literal_git_ref():
         cloud_type="COMMUNITY",
         max_seconds=100,
         config_path="cfg.yaml",
+        sweep_config_path=SWEEP_YAML,
     )
     args = build_docker_args(rec, "claude/some-branch-name")
     assert "git fetch origin claude/some-branch-name && git checkout FETCH_HEAD" in args
@@ -410,12 +419,15 @@ def test_docker_args_regenerates_the_sweep_when_sweep_config_path_is_set():
     assert args.index("generate_sweep.py") < args.index("run_experiment.py")
 
 
-def test_docker_args_omits_regen_when_sweep_config_path_is_unset():
-    """Backward-compat: a PodRecord without sweep_config_path (e.g. an old
-    state-file record) must not gain a broken regen step out of nowhere.
-    """
-    from tools.runpod_launch import PodRecord
+def test_docker_args_refuses_a_record_without_a_sweep_config_path():
+    """The inverse of the old backward-compat test, which had it backwards.
 
+    That test asserted a PodRecord with no sweep_config_path quietly produces a
+    command with no regen step. That is precisely the command the burned pilot
+    pods ran: the pod's fresh clone has no generated/exp_NNN.yaml, so the job
+    dies on boot and the pod bills anyway. A record without the path is never
+    one to launch, so building its command now raises.
+    """
     rec = PodRecord(
         sweep="s",
         exp="exp_000",
@@ -426,8 +438,64 @@ def test_docker_args_omits_regen_when_sweep_config_path_is_unset():
         max_seconds=100,
         config_path="cfg.yaml",
     )
-    args = build_docker_args(rec, "deadbeef")
-    assert "generate_sweep.py" not in args
+    with pytest.raises(ValueError, match="sweep_config_path is required"):
+        build_docker_args(rec, "deadbeef")
+
+
+def test_relaunch_refuses_without_a_sweep_config_path(tmp_path):
+    """Regression: relaunch() bypassed launch()'s guard entirely.
+
+    It builds its own PodRecord and calls create_pod() directly, taking
+    sweep_config_path from the state row -- and runpod_state.jsonl still holds
+    the burned pilot's rows with that field empty. One
+    `runpod_launch.py relaunch generated/a1c_compose_pilot --git-ref <sha>`
+    would have re-created the identical $8.93 failure.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
+    with pytest.raises(ValueError, match="sweep_config_path is required"):
+        relaunch(d, git_ref="x", state_path=state_path, client=client)
+    assert client.last_create_kwargs == {}
+
+
+def test_relaunch_ignores_an_empty_path_on_a_pre_guard_state_row(tmp_path):
+    """The explicit argument wins; the stale row is never trusted."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
+    rows = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["sweep_config_path"] = ""  # what the burned pilot's rows look like
+    state_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert "generate_sweep.py" in json.loads(f'"{client.last_create_kwargs["docker_args"]}"')
 
 
 # -- status / relaunch / watchdog ----------------------------------------
@@ -468,7 +536,14 @@ def test_relaunch_fills_freed_slots(tmp_path):
         state_path=state_path,
         sweep_config_path=SWEEP_YAML,
     )
-    r = relaunch(d, git_ref="x", max_concurrent=2, state_path=state_path, client=client)
+    r = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(r) == 1
     rows = status(state_path, client=client)
     running = [row for row in rows if row["state"] == "RUNNING"]
@@ -488,7 +563,14 @@ def test_relaunch_resumes_same_run_id_after_missing_pod(tmp_path):
         sweep_config_path=SWEEP_YAML,
     )
     del client.pods[created[0].pod_id]  # preempted
-    relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     rows = status(state_path, client=client)
     row = next(r for r in rows if r["run_id"] == created[0].run_id)
     assert row["state"] == "RUNNING"
@@ -533,7 +615,14 @@ def test_relaunch_ignores_queued_jobs_from_a_different_sweep(tmp_path):
         sweep_config_path=SWEEP_YAML,
     )
 
-    relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(relaunched) == 1
     assert relaunched[0].sweep == "toy_sweep"  # not the other sweep's job
 
@@ -599,6 +688,7 @@ def _backdated_record(client, run_id="h0_s0", age_seconds=900, booted=True):
         config_path="generated/toy/exp_000.yaml",
         name=f"bdhx-toy-{run_id}",
         created_at=time.time() - age_seconds,
+        sweep_config_path=SWEEP_YAML,
     )
     return rec, pod_id
 
@@ -661,7 +751,14 @@ def test_reap_stuck_boots_then_relaunch_picks_up_the_same_run_id(tmp_path):
     requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
     assert requeued == [stuck_run_id]
 
-    relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(relaunched) == 1
     assert relaunched[0].run_id == stuck_run_id  # same run_id -- --resume still applies
 
@@ -903,7 +1000,14 @@ def test_collect_marks_the_run_done_so_relaunch_does_not_retrain_it(tmp_path):
     # still QUEUED (never launched in the first place) and relaunch() is
     # right to backfill the slot the DONE job's termination freed up -- the
     # bug this test guards against is the DONE job itself getting relaunched.
-    relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert run_id not in [r.run_id for r in relaunched]  # not retrained
 
 
@@ -1098,3 +1202,78 @@ def test_watchdog_leaves_a_finished_but_uncollected_pod_alone(tmp_path):
     )
     assert watchdog(state_path, client=client) == []
     assert client.terminated == []
+
+
+def test_status_marks_a_pod_unknown_when_the_api_listing_fails(tmp_path):
+    """Regression: an API blip read as MISSING made relaunch duplicate a live pod.
+
+    relaunch() treats MISSING as retryable, and the new state row it appends
+    erases the original pod_id (latest_state_by_run_id keeps only the last), so
+    the first pod becomes invisible to watchdog, status, collect and
+    reap_stuck_boots -- billing on with only `reap --prefix` able to find it.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    pod_id = created[0].pod_id
+
+    def blip(_):
+        raise RuntimeError("503 from the API")
+
+    client.get_pod = blip
+    client.get_pods = blip
+    rows = {r["run_id"]: r["state"] for r in status(state_path, client=client)}
+    assert rows[created[0].run_id] == "UNKNOWN"
+
+    # UNKNOWN is not retryable, so the live run keeps its pod and its state row
+    # (the two QUEUED jobs of this manifest are still retried, as they should be)
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=3,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert created[0].run_id not in [r.run_id for r in relaunched]
+    from tools.runpod_launch import latest_state_by_run_id
+
+    assert latest_state_by_run_id(state_path)[created[0].run_id]["pod_id"] == pod_id
+    assert pod_id in client.pods
+
+
+def test_status_still_reports_missing_when_the_listing_succeeds(tmp_path):
+    """A pod absent from a listing that itself worked really is gone."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    client.pods.pop(created[0].pod_id)  # reaped
+    rows = {r["run_id"]: r["state"] for r in status(state_path, client=client)}
+    assert rows[created[0].run_id] == "MISSING"
+
+
+def test_http_text_survives_a_missing_curl(monkeypatch):
+    """Regression: FileNotFoundError escaped and emptied the whole status table."""
+    from tools.runpod_launch import _http_text
+
+    def no_curl(*a, **k):
+        raise FileNotFoundError(2, "No such file or directory: 'curl'")
+
+    monkeypatch.setattr("subprocess.run", no_curl)
+    assert _http_text("https://example.invalid/EXIT_CODE") is None

@@ -37,7 +37,13 @@ overrides:
   evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
   evaluation.diagnostics: true
 notes: >
-  Results carry generator_version 0.2.0 and must never be merged into one
-  plot with A1's compose rows, which carry 0.1.0.  ComposeTask(
-  guarantee_solvable=False) reproduces the old distribution if the two ever
-  need to be run side by side as an explicit arm.
+  Results carry generator_version 0.2.0 in metadata.json and must never be
+  merged into one plot with A1's compose rows, which predate that field
+  entirely.  Note the null to score against is the guessing floor
+  `1/n_examples_per_fn` = 0.125, not 1/vocab: the target is always the end of
+  one of the demonstrated paths, so "left the ln(vocab) plateau" is satisfied
+  by learning to emit a path endpoint and nothing else.  The pre-fix
+  distribution is ComposeTask(n_examples_per_fn=4, guarantee_solvable=False),
+  reachable from Python but deliberately NOT from a config: rerunning A1's
+  broken generator is not a sweep anyone should be able to launch by editing
+  a YAML.
