@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from tools.runpod_launch import (
     collect,
     estimate,
     launch,
+    print_status,
     read_manifest,
     reap,
     reap_stuck_boots,
@@ -28,6 +30,10 @@ from tools.runpod_launch import (
     status,
     watchdog,
 )
+
+# launch() requires a committed sweep YAML: the pod regenerates the gitignored
+# generated/exp_NNN.yaml files from it.  Any real one will do here.
+SWEEP_YAML = "configs/stage_a/a1_first_experiment.yaml"
 
 
 def write_manifest(dir_: Path, rows: list[dict]) -> Path:
@@ -164,14 +170,27 @@ def test_rates_file_has_verified_a5000_and_4090():
 def test_launch_refuses_above_thresholds_without_allow_large_sweep(tmp_path):
     d = three_job_manifest(tmp_path, minutes=1000.0)  # 3 jobs * ~16.7h = way over 20h
     with pytest.raises(ValueError, match="allow-large-sweep"):
-        launch(d, git_ref="deadbeef", client=FakeRunpod(), state_path=tmp_path / "state.jsonl")
+        launch(
+            d,
+            git_ref="deadbeef",
+            client=FakeRunpod(),
+            state_path=tmp_path / "state.jsonl",
+            sweep_config_path=SWEEP_YAML,
+        )
 
 
 def test_launch_creates_pods_and_appends_state_before_returning(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="deadbeef", max_concurrent=2, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="deadbeef",
+        max_concurrent=2,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(created) == 3
     launched = [r for r in created if r.pod_id]
     queued = [r for r in created if not r.pod_id]
@@ -186,7 +205,14 @@ def test_launch_creates_pods_and_appends_state_before_returning(tmp_path):
 def test_launch_dry_run_creates_no_pods(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
-    launch(d, git_ref="deadbeef", client=client, state_path=tmp_path / "state.jsonl", dry_run=True)
+    launch(
+        d,
+        git_ref="deadbeef",
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(client.pods) == 0
 
 
@@ -208,7 +234,12 @@ def test_launch_survives_one_create_pod_failure_and_queues_it(tmp_path):
 
     client.create_pod = flaky_create_pod
     created = launch(
-        d, git_ref="x", max_concurrent=2, client=client, state_path=tmp_path / "state.jsonl"
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        sweep_config_path=SWEEP_YAML,
     )
     assert len(created) == 3  # all 3 jobs accounted for, none dropped
     launched = [r for r in created if r.pod_id]
@@ -221,7 +252,15 @@ def test_relaunch_survives_one_create_pod_failure(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    launch(d, git_ref="x", max_concurrent=0, client=client, state_path=state_path, dry_run=True)
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
 
     calls = {"n": 0}
     real_create_pod = client.create_pod
@@ -266,7 +305,14 @@ def test_launch_passes_escaped_docker_args_to_create_pod(tmp_path):
     """
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
-    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=tmp_path / "state.jsonl")
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        sweep_config_path=SWEEP_YAML,
+    )
     sent = client.last_create_kwargs["docker_args"]
     decoded = json.loads(
         f'"{sent}"'
@@ -284,7 +330,7 @@ def test_launch_threads_sweep_config_path_into_the_startup_command(tmp_path):
         max_concurrent=1,
         client=client,
         state_path=tmp_path / "state.jsonl",
-        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
+        sweep_config_path=SWEEP_YAML,
     )
     sent = client.last_create_kwargs["docker_args"]
     decoded = json.loads(f'"{sent}"')
@@ -391,7 +437,14 @@ def test_status_classifies_running_queued_missing(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=2, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     # kill one launched pod out from under the launcher (simulates preemption)
     dead_pod_id = created[0].pod_id
     del client.pods[dead_pod_id]
@@ -407,7 +460,14 @@ def test_relaunch_fills_freed_slots(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     r = relaunch(d, git_ref="x", max_concurrent=2, state_path=state_path, client=client)
     assert len(r) == 1
     rows = status(state_path, client=client)
@@ -419,7 +479,14 @@ def test_relaunch_resumes_same_run_id_after_missing_pod(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     del client.pods[created[0].pod_id]  # preempted
     relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
     rows = status(state_path, client=client)
@@ -456,7 +523,15 @@ def test_relaunch_ignores_queued_jobs_from_a_different_sweep(tmp_path):
         ),
         state_path,
     )
-    launch(d, git_ref="x", max_concurrent=0, client=client, state_path=state_path, dry_run=True)
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
 
     relaunched = relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
     assert len(relaunched) == 1
@@ -469,6 +544,7 @@ def test_watchdog_terminates_pods_over_grace_period(tmp_path):
     state_path = tmp_path / "state.jsonl"
     created = launch(
         d,
+        sweep_config_path=SWEEP_YAML,
         git_ref="x",
         max_concurrent=1,
         max_wall_clock_minutes=10,
@@ -488,6 +564,7 @@ def test_watchdog_leaves_pods_within_grace_period(tmp_path):
     state_path = tmp_path / "state.jsonl"
     created = launch(
         d,
+        sweep_config_path=SWEEP_YAML,
         git_ref="x",
         max_concurrent=1,
         max_wall_clock_minutes=10,
@@ -566,7 +643,14 @@ def test_reap_stuck_boots_then_relaunch_picks_up_the_same_run_id(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     stuck_run_id = created[0].run_id
     client.pods[created[0].pod_id]["runtime"]["ports"] = []
     # backdate the just-launched record past the grace window
@@ -628,7 +712,14 @@ def test_collect_skips_missing_pods_without_crashing(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     del client.pods[created[0].pod_id]
     result = collect(d, tmp_path / "out", state_path=state_path, client=client)
     assert result["pulled"] == []
@@ -639,7 +730,14 @@ def test_collect_skips_when_fetch_fails(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
 
     def failing_fetch(url, dest):
         return False
@@ -656,7 +754,14 @@ def test_collect_fetches_and_extracts_tarball(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     run_id = created[0].run_id
 
     def fake_fetch(url, dest):
@@ -690,7 +795,14 @@ def test_collect_flattens_the_double_nested_run_dir(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     run_id = created[0].run_id
 
     def fake_fetch(url, dest):
@@ -718,7 +830,14 @@ def test_collect_terminate_on_collect_only_after_success(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
 
     def failing_fetch(url, dest):
         return False
@@ -747,7 +866,14 @@ def test_collect_marks_the_run_done_so_relaunch_does_not_retrain_it(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     run_id = created[0].run_id
 
     def fake_fetch(url, dest):
@@ -787,7 +913,14 @@ def test_reap_stuck_boots_leaves_done_runs_alone(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     run_id = created[0].run_id
     append_state(
         PodRecord(
@@ -828,3 +961,140 @@ def test_read_manifest_run_id_matches_config_hash_and_seed(tmp_path):
     jobs = read_manifest(d)
     assert jobs[0].run_id == "h0_s0"
     assert all(isinstance(j, ManifestJob) for j in jobs)
+
+
+# -- the A1c/A4 pilot burn: two guards that were not there ------------------
+
+
+def test_launch_refuses_without_a_sweep_config_path(tmp_path):
+    """Regression: the A1c/A4 pilot was launched without --sweep-config-path.
+
+    generated/ is gitignored, so every one of the six pods failed seconds
+    after boot with FileNotFoundError on generated/<sweep>/exp_NNN.yaml. A
+    crashed job still tars its output and sleeps, and RunPod keeps a pod
+    allocated after its docker command exits, so all six kept billing at
+    $0.74/hr until they were reaped by hand 2.2 hours later -- about $8.90
+    for no science. The flag was optional and the failure silent; both are
+    fixed.
+    """
+    d = three_job_manifest(tmp_path)
+    with pytest.raises(ValueError, match="sweep_config_path is required"):
+        launch(d, git_ref="x", client=FakeRunpod(), state_path=tmp_path / "state.jsonl")
+
+
+def test_launch_refuses_a_sweep_config_path_that_is_not_in_the_repo(tmp_path):
+    """The pod resolves the path inside its own clone, so it must be committed."""
+    d = three_job_manifest(tmp_path)
+    with pytest.raises(ValueError, match="does not exist in the repo"):
+        launch(
+            d,
+            git_ref="x",
+            client=FakeRunpod(),
+            state_path=tmp_path / "state.jsonl",
+            sweep_config_path="configs/stage_a/not_a_real_sweep.yaml",
+        )
+
+
+def test_watchdog_falls_back_to_created_at_when_the_api_reports_no_uptime(tmp_path):
+    """Regression: every pilot pod came back with no `uptimeSeconds` at all.
+
+    `runtime` was populated (ports were bound, so the pod HAD booted), but
+    `uptimeSeconds` was absent for the pod's whole life. watchdog() read that
+    as "no information" and skipped the pod, so a 90-minute cap never fired.
+    The launcher writes `created_at` itself, so it always has a wall-clock
+    lower bound to fall back on.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        max_wall_clock_minutes=10,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    pod = client.pods[created[0].pod_id]
+    pod.pop("uptimeSeconds")
+    # created_at is now, so nothing is over the limit yet
+    assert watchdog(state_path, client=client) == []
+    # rewrite the state with a creation time well past 1.5 x the 10-minute cap
+    rows = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["created_at"] = time.time() - 40 * 60
+    state_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert watchdog(state_path, client=client) == [created[0].pod_id]
+
+
+def test_print_status_estimates_cost_without_uptime(tmp_path, capsys):
+    """ "$0.000 so far" for 2.2 hours is how the burn stayed invisible."""
+    rows = [
+        {
+            "run_id": "r1",
+            "pod_id": "pod-1",
+            "state": "RUNNING",
+            "created_at": time.time() - 3600,
+            "pod": {"id": "pod-1", "costPerHr": 0.74},
+        }
+    ]
+    print_status(rows)
+    out = capsys.readouterr().out
+    assert "$0.74" in out and "(est.)" in out
+
+
+def test_status_surfaces_a_job_that_already_exited(tmp_path, capsys):
+    """A pod whose job crashed looks RUNNING to the API; the exit code says otherwise."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    rows = status(state_path, client=client, check_exit_codes=True, fetch=lambda url, t: "1\n")
+    running = [r for r in rows if r["state"] == "RUNNING"]
+    assert running and running[0]["exit_code"] == 1
+    print_status(rows)
+    assert "job exited 1, awaiting collect" in capsys.readouterr().out
+
+
+def test_status_leaves_exit_code_unset_while_the_job_is_still_running(tmp_path):
+    """EXIT_CODE is not written until run_experiment.py returns."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    rows = status(state_path, client=client, check_exit_codes=True, fetch=lambda url, t: None)
+    running = [r for r in rows if r["state"] == "RUNNING"]
+    assert running and running[0]["exit_code"] is None
+
+
+def test_watchdog_leaves_a_finished_but_uncollected_pod_alone(tmp_path):
+    """The pod holds the only copy of the run directory until collect fetches it."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        max_wall_clock_minutes=10,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert watchdog(state_path, client=client) == []
+    assert client.terminated == []

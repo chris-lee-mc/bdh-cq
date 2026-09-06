@@ -420,6 +420,22 @@ def launch(
     if client is None:
         client = _default_client()
 
+    # Checked here rather than only in the CLI so `relaunch` and any other
+    # caller get the same guard. The failure this prevents is silent and
+    # expensive: the job crashes seconds after boot, the pod tars its output
+    # and sleeps, and billing continues until a reap.
+    if not sweep_config_path:
+        raise ValueError(
+            "sweep_config_path is required: generated/ is gitignored, so the "
+            "pod regenerates exp_NNN.yaml from the source sweep YAML"
+        )
+    if not (PROJECT_ROOT / sweep_config_path).exists():
+        raise ValueError(
+            f"sweep_config_path {sweep_config_path!r} does not exist in the repo; "
+            "the pod resolves it relative to its own clone, so it must be a "
+            "committed path"
+        )
+
     generated_dir = Path(generated_dir)
     sweep = generated_dir.name
     jobs = read_manifest(generated_dir)
@@ -513,7 +529,12 @@ def classify(pod: dict | None) -> str:
     return status or "UNKNOWN"
 
 
-def status(state_path: Path = DEFAULT_STATE_FILE, client=None) -> list[dict]:
+def status(
+    state_path: Path = DEFAULT_STATE_FILE,
+    client=None,
+    check_exit_codes: bool = False,
+    fetch=None,
+) -> list[dict]:
     if client is None:
         client = _default_client()
 
@@ -536,7 +557,10 @@ def status(state_path: Path = DEFAULT_STATE_FILE, client=None) -> list[dict]:
             pod = client.get_pod(rec["pod_id"])
         except Exception:  # noqa: BLE001 - a not-found pod means MISSING, not a crash
             pod = None
-        rows.append({**rec, "state": classify(pod), "pod": pod})
+        row = {**rec, "state": classify(pod), "pod": pod}
+        if row["state"] == "RUNNING" and check_exit_codes:
+            row["exit_code"] = job_exit_code(rec["pod_id"], rec["run_id"], fetch=fetch)
+        rows.append(row)
     return rows
 
 
@@ -544,9 +568,19 @@ def print_status(rows: list[dict]) -> None:
     for r in rows:
         cost = ""
         pod = r.get("pod")
-        if pod and pod.get("costPerHr") is not None and pod.get("uptimeSeconds") is not None:
-            cost = f"  ${float(pod['costPerHr']) * float(pod['uptimeSeconds']) / 3600:.3f} so far"
-        print(f"{r['run_id']:40s} {r['state']:10s} pod={r.get('pod_id') or '-'}{cost}")
+        elapsed = elapsed_seconds(r) if pod else None
+        if pod and pod.get("costPerHr") is not None and elapsed is not None:
+            # `elapsed_seconds` falls back to time since creation, so a pod the
+            # API reports no uptime for still shows a real running cost rather
+            # than "$0.000 so far".
+            estimated = "" if pod.get("uptimeSeconds") is not None else " (est.)"
+            cost = f"  ${float(pod['costPerHr']) * elapsed / 3600:.3f} so far{estimated}"
+        exited = ""
+        if r.get("exit_code") is not None:
+            # RUNNING here means the POD is allocated, not that the job is: a
+            # pod whose job exited keeps billing until collect or reap ends it.
+            exited = f"  job exited {r['exit_code']}, awaiting collect"
+        print(f"{r['run_id']:40s} {r['state']:10s} pod={r.get('pod_id') or '-'}{cost}{exited}")
 
 
 def relaunch(
@@ -618,7 +652,58 @@ def relaunch(
     return relaunched
 
 
+def elapsed_seconds(row: dict, now: float | None = None) -> float | None:
+    """How long a pod has been up: the API's uptime, else time since creation.
+
+    `uptimeSeconds` is not always populated -- Secure Cloud returned
+    `runtime: {ports: [...]}` with no `uptimeSeconds` at all for every pod of
+    the A1c/A4 pilot, for their whole lives. watchdog() read that as "no
+    information" and skipped them, so six pods whose jobs had crashed in the
+    first seconds sat at $0.74/hr for 2.2 hours past a 90-minute cap, and
+    print_status() showed "$0.000 so far" the entire time. The launcher writes
+    `created_at` itself when it creates the pod, so it always has a wall-clock
+    lower bound to fall back on; it can only over-estimate elapsed time by the
+    boot delay, which is the safe direction for a timeout.
+    """
+    pod = row.get("pod") or {}
+    uptime = pod.get("uptimeSeconds")
+    if uptime is not None:
+        return float(uptime)
+    created = row.get("created_at")
+    if created is None:
+        return None
+    return max((time.time() if now is None else now) - float(created), 0.0)
+
+
+def job_exit_code(pod_id: str, run_id: str, fetch=None, timeout: int = 20) -> int | None:
+    """The job's exit code, read over the pod's HTTP proxy, or None if not written yet.
+
+    build_docker_args() writes EXIT_CODE the moment run_experiment.py returns,
+    then tars the run directory and sleeps. RunPod keeps the pod allocated after
+    its docker command exits, so from the API a pod whose job crashed in the
+    first ten seconds is indistinguishable from one that is still training --
+    which is how six pilot pods billed for 2.2 hours on jobs that had already
+    failed. This is the cheap signal that tells them apart.
+    """
+    fetch = fetch or _http_text
+    text = fetch(f"{pod_proxy_url(pod_id)}/{run_id}/EXIT_CODE", timeout)
+    if text is None:
+        return None
+    try:
+        return int(text.strip())
+    except ValueError:
+        return None
+
+
 def watchdog(state_path: Path = DEFAULT_STATE_FILE, client=None, grace: float = 1.5) -> list[str]:
+    """Terminate pods that have overrun their wall clock. Returns the pod ids.
+
+    Deliberately does NOT reap a pod whose job has merely exited: the pod holds
+    the only copy of the run directory until `collect` fetches it, so ending a
+    finished-but-uncollected pod would throw the results away. `collect
+    --terminate-on-collect` is what ends a finished job; this is the safety net
+    for one that never finishes.
+    """
     if client is None:
         client = _default_client()
 
@@ -627,9 +712,9 @@ def watchdog(state_path: Path = DEFAULT_STATE_FILE, client=None, grace: float = 
         pod = r.get("pod")
         if not pod or r["state"] != "RUNNING":
             continue
-        uptime = pod.get("uptimeSeconds")
+        elapsed = elapsed_seconds(r)
         limit = r.get("max_seconds")
-        if uptime is not None and limit and uptime > grace * limit:
+        if elapsed is not None and limit and elapsed > grace * limit:
             client.terminate_pod(r["pod_id"])
             terminated.append(r["pod_id"])
     return terminated
@@ -731,6 +816,21 @@ def _http_fetch(url: str, dest: Path, timeout: int = 120) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+def _http_text(url: str, timeout: int = 20) -> str | None:
+    """GET a small file as text; None on any failure (missing file, dead pod)."""
+    try:
+        result = subprocess.run(
+            ["curl", "-fsS", "--max-time", str(timeout), url],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 10,
+            check=False,
+        )
+    except subprocess.SubprocessError:
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def _flatten_double_nested_run_dir(run_dir: Path) -> None:
@@ -854,10 +954,13 @@ def main(argv: list[str] | None = None) -> int:
     p_launch.add_argument("--dry-run", action="store_true")
     p_launch.add_argument(
         "--sweep-config-path",
-        default="",
+        required=True,
         help="source YAML generated_dir was expanded from (e.g. "
-        "configs/stage_a/a1_first_experiment.yaml); required for the pod to "
-        "regenerate exp_NNN.yaml, since generated/ is gitignored",
+        "configs/stage_a/a1_first_experiment.yaml); the pod regenerates "
+        "exp_NNN.yaml from it, since generated/ is gitignored. Required: "
+        "omitting it fails every job with FileNotFoundError on cfg.config_path "
+        "seconds after boot, and because a crashed job still tars its output "
+        "and sleeps, the pods keep billing until something reaps them",
     )
     p_launch.add_argument(
         "--s3-bucket",
@@ -919,7 +1022,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         launched = sum(1 for r in created if r.pod_id)
         print(f"{launched} pods created, {len(created) - launched} queued")
     elif args.cmd == "status":
-        print_status(status())
+        # The human-facing command pays for one small HTTPS GET per running
+        # pod so a finished-but-uncollected job is visible rather than
+        # indistinguishable from one still training.
+        print_status(status(check_exit_codes=True))
     elif args.cmd == "relaunch":
         r = relaunch(
             args.generated_dir,
