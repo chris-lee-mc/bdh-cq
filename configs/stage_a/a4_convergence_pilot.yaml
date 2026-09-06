@@ -1,0 +1,52 @@
+# Stage A, experiment A4-pilot: does any update rule make the loop converge?
+#
+# A screen, not evidence.  One seed per arm at 20 percent of A1's step budget,
+# to answer one question before ~$40 goes into the full a4_convergence.yaml:
+# does any of the three recurrence kinds move `cos(H[R], H[R-1])` at R=32 off
+# the 0.74-0.80 that plain BDH-CQ sits at (RESULTS.md section A1b)?
+#
+# Unlike the compose pilot this is close to two-sided.  `cos_last` measures
+# the learned map's contraction, not its accuracy, and a mechanism that pulls
+# the map toward the identity (residual, init_skip) or re-anchors it to the
+# seed (attn_residual) should show up in it early -- a plain arm already has
+# cos_last near its final value well before convergence of the loss.  A pilot
+# in which all three sit at plain's value is a real reason not to spend the
+# rest.
+#
+# The plain reference is A1's bdh_cq/propagate seeds, but those are at 40000
+# steps and the full evaluation grid, so the pilot ALSO needs its own plain
+# arm to compare against at 8000 steps.  That is the fourth job.
+sweep:
+  name: a4_convergence_pilot
+  stage: A
+  description: >
+    One seed of bdh_cq x {plain, attn_residual, init_skip} on
+    propagate at 8000 steps; go/no-go screen for a4_convergence.
+# A pilot is dev by construction: 1 seed, so every row is tagged `dev` and
+# `DEV`-flagged by the aggregator and can never be cited as evidence.
+dev: true
+base: configs/base/default.yaml
+grid:
+  # `residual` is dropped from the screen: it is the control that separates
+  # init_skip's seed re-anchoring from a merely smaller step, which only
+  # matters once something wins.  It stays in the full a4_convergence.yaml.
+  model.recurrence.kind: [plain, attn_residual, init_skip]
+  task.name: [propagate]
+seeds: [1]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 8000
+  training.warmup_steps: 200
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 4, 8, 32]
+  evaluation.diagnostics: true
+  task.n_eval_episodes: 200
+  compute.max_wall_clock_minutes: 90
+controls:
+  matched_controls: false

@@ -1,0 +1,4 @@
+exp,config_hash,seed,model,task,control_of,est_gpu_minutes
+exp_000,3d6407474980,1,bdh_cq,propagate,,80.1
+exp_001,a976f5e26896,1,bdh_cq,propagate,,80.1
+exp_002,eca47f97dfa3,1,bdh_cq,propagate,,80.1

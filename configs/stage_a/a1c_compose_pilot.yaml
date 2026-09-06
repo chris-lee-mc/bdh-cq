@@ -1,0 +1,48 @@
+# Stage A, experiment A1c-pilot: is the fixed compose generator learnable at all?
+#
+# A screen, not evidence.  One seed per arm at 20 percent of A1's step budget,
+# with a reduced evaluation grid, to answer one question before ~$27 goes into
+# the full a1c_compose_rerun.yaml: does `looped_transformer` leave the
+# ln(vocab) = 8.326 plateau on compose now that every episode is answerable?
+# A1 had it AT_CHANCE in 3/3 seeds over 40000 steps, and RESULTS.md section
+# A1a shows 71 percent of its training episodes had an answer that was absent
+# from their own context.
+#
+# Read as a ONE-SIDED test.  Leaving the plateau at 8000 steps is decisive and
+# funds the full sweep; still sitting on it at 8000 steps is not, because
+# 8000 steps may simply be too few.  The training loss curve in train_log.csv
+# is the readout, not the accuracy tables.
+#
+# The LR schedule keeps A1's shape: warmup is 2.5 percent of steps in both.
+sweep:
+  name: a1c_compose_pilot
+  stage: A
+  description: >
+    One seed of each A1 arm on the fixed compose generator at 8000 steps;
+    go/no-go screen for a1c_compose_rerun.
+# A pilot is dev by construction: 1 seed, so every row is tagged `dev` and
+# `DEV`-flagged by the aggregator and can never be cited as evidence.
+dev: true
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, bdh_cq, looped_transformer]
+  task.name: [compose]
+seeds: [1]
+overrides:
+  model.params_target: 10_000_000
+  model.recurrence.kind: plain
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 8000
+  training.warmup_steps: 200
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  # Trimmed from A1's {1,2,4,8,16,32} x 1000 episodes: evaluation cost does
+  # not scale with the step budget, so leaving it at full size would have made
+  # the pilot cost a third of the sweep it is meant to gate.
+  evaluation.reasoning_steps: [1, 4, 8, 32]
+  evaluation.diagnostics: true
+  task.n_eval_episodes: 200
+  compute.max_wall_clock_minutes: 90
