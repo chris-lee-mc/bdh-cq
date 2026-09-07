@@ -15,13 +15,27 @@ throughout:
 - GUESS: an implementation choice the community author made without a
   public specification, or that we inferred.
 
-Sourcing caveat: arXiv full texts were not fetchable from the research
-environment. Paper statements below come from the abstracts, Pathway's
-public explainer pages, and secondary technical summaries. Every row
-marked "verify" must be checked against the PDF before it is cited in a
-report. Two facts were verified from primary sources directly: the
-Pathway reference code and the community code including its commit
-history.
+Sourcing caveat: at v0.1 the arXiv full texts were not fetchable from the
+research environment, so paper statements below come from the abstracts,
+Pathway's public explainer pages, and secondary technical summaries. Every
+row still marked "verify" must be checked against the PDF before it is
+cited in a report. Verified from primary sources directly: the Pathway
+reference code, the community code including its commit history, and (added
+2026-09-07, when the full text did fetch) the single row this project's
+conclusions rest on -- the latent transition function, section 1 row 14.
+
+That row is now confirmed against the paper itself rather than a summary.
+BDH-CQ (arXiv 2608.09888) gives only the signature of the update,
+
+    H_{r+1} = F_theta(H_r, S_K),   r = 0, ..., R-1        (eq. 3)
+
+and states that "dimensions, exact update rules, and implementation details
+remain proprietary". The paper also does not test or claim R_test greater
+than R_train_max: it reports scaling inference effort (LOW/MEDIUM/HIGH, 21
+to 29.5 percent pass@2 on ARC-AGI-1) without saying whether those levels
+were trained. So Stage A's Gate D failure contradicts no published claim,
+and the GUESS label on row 14 is correct rather than merely cautious. The
+remaining "verify" rows are unchanged and still unchecked.
 
 Confidence scale: High = verified in code and consistent with paper
 text; Medium = code verified, paper statement from secondary summary;

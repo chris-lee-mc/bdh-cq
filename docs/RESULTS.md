@@ -33,6 +33,33 @@ Question: can BDH-CQ (community) (and BDH, looped Transformer) learn an
 iterative algorithm that benefits from more test-time loops than it saw
 in training?
 
+**What is under test, and what is not.** The latent transition function --
+the per-step update this whole stage measures -- is not public. The BDH-CQ
+paper (arXiv 2608.09888) gives only its signature, `H_{r+1} = F_theta(H_r,
+S_K)` (eq. 3), and states that "dimensions, exact update rules, and
+implementation details remain proprietary". Verified against the paper's
+full text on 2026-09-07, not a secondary summary. The community author says
+the same in his own code: "sans knowing their secretive latent transition
+function" (`bdh_cq.py:412`). So every result in Stage A is a result about
+`lucidrains/bdh-cq`'s reconstruction at `c246f890`, not about Pathway's
+model, and no negative result here can be read as a refutation of the paper.
+`docs/PAPER_IMPLEMENTATION_GAPS.md` section 3 is the standing rule; this
+paragraph is where the rule gets applied.
+
+Two consequences worth stating once, because A4 and A5 are the results most
+likely to be over-read:
+
+- The paper never claims extrapolation past the trained step count. It
+  reports scaling *inference* effort (LOW/MEDIUM/HIGH, 21 to 29.5 percent
+  pass@2 on ARC-AGI-1) but does not say whether those levels were trained,
+  and does not test R_test > R_train_max. This project's Gate D failure
+  therefore contradicts nothing the paper asserts.
+- The comparison that survives all of this is the internal one. Under an
+  identical harness, task, parameter budget and training FLOPs,
+  `looped_transformer` does extrapolate and this loop does not. That is a
+  sound statement about the two designs actually run, and it does not
+  depend on either being the paper's.
+
 Gate A finding: **yes, conditionally.** BDH-CQ (community) at R_test =
 R_train_max = 4 produces a large, credible improvement over the matched
 fixed-depth baseline on the `propagate` task's `mild` extrapolation split
