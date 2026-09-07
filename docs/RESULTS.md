@@ -869,6 +869,91 @@ pilot's measured ms/step; the estimate held to within 9 percent. About 1.0
 GPU-hour (~$0.77) of that was pods sitting finished-but-uncollected, which was
 avoidable and is written up in the ledger.
 
+### A5. The collapse is the trained range, and nothing else
+
+Full sweep, 3 jobs (`bdh_cq`/`plain` on `propagate`, `reasoning.train_steps:
+[1,2,4,8]`, 3 seeds, 40000 steps, ~10M params),
+`configs/stage_a/a5_r_train_extension.yaml`, read against A1's
+`bdh_cq`/`plain` cell (`f0b8b7c55f92`, the same model trained on
+`[1,2,4]`). All 3 exit 0 at step 40000, final train loss 3.9e-4 to 4.9e-4,
+0 AT_CHANCE, 0 diverged, 0 relaunches. Tables in `reports/2026-09-07-a5/`,
+copied to `docs/results/a5/`.
+
+**Exact match moves with `R_train_max`, one for one.** `interp` split, final
+checkpoint, 3 seeds x 1000 episodes per cell, bootstrap 95% CI in brackets.
+Both arms are the same architecture at the same 10,010,880 parameters; the
+only difference is which R values training sampled.
+
+| R_test | A1, trained {1,2,4} | A5, trained {1,2,4,8} |
+|--------|---------------------|-----------------------|
+| 1  | 0.998 [0.997, 1.000] | 0.994 [0.982, 1.000] |
+| 2  | 0.999 [0.997, 1.000] | 0.995 [0.988, 1.000] |
+| 4  | 0.997 [0.994, 1.000] | 0.980 [0.973, 0.991] |
+| 8  | **0.000 [0.000, 0.000]** | **0.991 [0.985, 0.997]** |
+| 16 | 0.000 [0.000, 0.000] | 0.001 [0.000, 0.003] |
+| 32 | 0.000 [0.000, 0.000] | 0.000 [0.000, 0.000] |
+
+Rows are the `distance=1, length=12` difficulty; `distance=2` and
+`distance=4` agree to within 0.01 everywhere, including the 0.000 cells (see
+`docs/results/a5/acc_vs_reasoning_steps_propagate.csv` for all three).
+
+At R=8 the CIs are disjoint and the gap is 0.991, against this file's 0.05
+threshold. This clears the bar by a wider margin than any result in the
+project so far.
+
+**H-capacity is refuted.** BDH-CQ (community) composes the operation eight
+times at 0.991 exact match. There is no capacity ceiling at four, and the
+reading offered in A4's follow-up -- that the architecture "cannot compose
+the operation more than a few times whatever it is shown" -- is wrong. It
+composes exactly as many times as it was trained to.
+
+**H-readout is confirmed, in its strongest form.** The failure boundary is
+not near `R_train_max`, it is exactly at it. Train to 4: 0.997 at R=4,
+0.000 at R=8. Train to 8: 0.991 at R=8, 0.001 at R=16. The model acquires
+the trained set and generalizes zero steps past it.
+
+**What that costs the architecture's premise.** The point of latent
+recurrence is to train short and think longer at test time. This
+reconstruction has none of that: extra test-time loops buy exactly nothing
+outside the trained range, and the only way to get accuracy at R is to have
+trained at R. That is a sharper negative than "it fails to extrapolate",
+because it rules out the gentler reading in which the loop degrades
+gradually and might be nursed further with better conditioning.
+
+**It also settles A4 retroactively.** Forcing the loop to a perfect fixed
+point changed nothing because convergence was never the mechanism; the
+readout had simply never seen states from outside the trained set. A4
+established that by elimination, A5 establishes it directly.
+
+**The one thing that survives past the boundary is token accuracy.** At
+R=16 and R=32 the A5 arm holds `token_acc` 0.73 to 0.81 while exact match
+is ~0.00 (A1's arm: 0.64 to 0.78 past its own boundary). The state is not
+destroyed by the extra iterations and is not at chance -- it is degraded
+just enough that no full answer survives. Whatever the extra loops do, they
+are not diverging into noise, which is consistent with A4's finding that
+convergence is separable from correctness.
+
+**Scope.** Per the caveat at the head of this stage: the latent transition
+function is not published, so this is a property of `lucidrains/bdh-cq` at
+`c246f890`, not of Pathway's model. The paper states no trained range and
+makes no extrapolation claim, so A5 answers a question it leaves open
+rather than contradicting it.
+
+**Cost.** 4.15 GPU-hours, $3.07, against a 5.35 GPU-hour / $3.96 estimate:
+22 percent under, the second cost prediction in a row to land close and the
+first to come in under. Per-pod alive time 79.6, 79.9 and 89.8 minutes.
+
+**What A5 does not test, and the free experiment that follows.** Every
+trained value here is a power of two, and every tested value outside the
+trained set is also outside its *range*. So this cannot distinguish two
+readings: the model learned the trained SET (and R=6 would fail even though
+it lies between 4 and 8), or it learned the trained INTERVAL (and R=6 would
+work). The distinction matters -- an interval-learner extrapolates within a
+range and would make "train on {1,32}" a sensible cheap recipe, a
+set-learner would not. Evaluating the existing A5 checkpoints at R in
+{3,5,6,7} answers it at zero GPU cost, since the checkpoints are already
+on disk. This is the next thing to run.
+
 ### A2. Recurrence curriculum repeat
 
 Pending, and **it does not test what this document twice said it tests.**
@@ -984,23 +1069,24 @@ curriculum, is now the live hypothesis. In priority order:
    0.000 at R=8 for all three arms and all 9 seeds. The half of the question
    this entry treated as the interesting half was answered yes, and it turned
    out not to be the half that mattered.
-3. **A5, extend R_train_max** (`configs/stage_a/a5_r_train_extension.yaml`,
-   3 jobs = `bdh_cq`/`plain` on `propagate` with `train_steps: [1,2,4,8]` x 3
-   seeds, 5.35 GPU-hours, ~$3.96, ~$5.15 with contingency). **The cheapest
-   live question in Stage A, and the next one to run.** A4 leaves exactly two
-   hypotheses -- the readout has only ever been asked to read states from R in
-   {1,2,4} (so the peak should follow the trained set), or BDH-CQ cannot
-   compose the operation more than a few times whatever it is shown (so it
-   should not). They differ on one manipulation that no run in this project
-   has made: training outside {1,2,4}. Reuses A1's arm as the R_train_max=4
-   reference on the same verified-matched basis A4 used -- both build at
-   10,010,880 params, because `build_model()` never passes `r_max` and
-   `plain`'s runner adds none -- so it is 3 jobs, not 6.
-4. ~~**A2 as written**~~ **Demoted: it cannot test this.** Both of A2's arms
-   cap `R_train_max` at 4; see section A2 above for the numbers. Worth running
-   only if A5 says the peak moves.
+3. ~~**A5, extend R_train_max**~~ **Done, 2026-09-07, 4.15 GPU-hours /
+   $3.07. See section A5.** The peak moved exactly one-for-one with the
+   trained set: 0.991 exact match at R=8 against A1's 0.000, disjoint CIs,
+   and a fresh 0.001 cliff at R=16. H-readout confirmed, H-capacity refuted.
+4. **A5b, the set-vs-interval question** (no config yet, **0 GPU-hours**).
+   Re-evaluate the A5 checkpoints already on disk at R in {3,5,6,7}. Every
+   value A5 trained is a power of two and every value it tested outside the
+   trained set is also outside the trained range, so A5 cannot tell "learned
+   the trained SET" from "learned the trained INTERVAL". R=6 separates them.
+   An interval-learner would make "train on {1,32}" a cheap recipe; a
+   set-learner would not. Free, and it should run before anything paid.
+5. ~~**A2 as written**~~ **Demoted: it cannot test this.** Both of A2's arms
+   cap `R_train_max` at 4; see section A2 above for the numbers. A5 has now
+   answered the question A2 was being kept for, so A2's remaining value is
+   only its ordering question, at 24 jobs. Not worth it.
 
-(2) is done. (1) is not started and still needs an explicit cost decision.
+(2) and (3) are done. (4) is free and next. (1) is not started and still
+needs an explicit cost decision.
 The combined 8000-step pilot proposed here was run (section A1c/A4 pilots) and
 was worth its ~$1.15: it is what replaced the ~$40 A4 estimate with the
 measured ~$9 one, and what showed that an accuracy-free `cos_last` target is
@@ -1046,6 +1132,7 @@ Gate D finding: pending.
 | 2026-09-03 | A | Gate A diagnosis (binding, sanity_learnability + BDH acceptance runs) | none (4 CPU cores) | 0.0 | 0.00 | about 20 CPU jobs of 3000 steps each plus a standalone reference reproduction; see section A0 |
 | 2026-09-06 | A | a1c/a4 pilots (6 jobs, 1 seed, 8000 steps) | RTX 4090, Secure Cloud | ~1.6 | ~1.15 | All 6 exit 0, collected, pods terminated on collection; `get_pods()` confirmed zero remaining. Training wall clock 0.95 GPU-hours; the rest is boot, clone and pip per pod. Came in at a quarter of the $5.27 estimate because A1's profiled per-job minutes are about 6x conservative for training. Findings in section A1c/A4 above: A1c returned no signal (one-sided by design), A4 refuted its own premise and is worth more than the $40 sweep it was screening. |
 | 2026-09-06 | A | a1c/a4 pilot, first attempt (FAILED, no results) | RTX 4090, Secure Cloud | ~12.1 | ~8.93 | 6 pods launched without `--sweep-config-path`. `generated/` is gitignored, so every job died seconds after boot with FileNotFoundError on its own config. A crashed job still tars its output and sleeps, and RunPod keeps a pod allocated after its docker command exits, so all six billed at $0.74/hr until reaped by hand 2.2 hours later. The 90-minute `--max-wall-clock-minutes` cap did not fire: the API returned no `uptimeSeconds` for any of these pods, and watchdog() skipped every pod it could not time. `print_status` showed "$0.000 so far" throughout for the same reason. All three are fixed with regression tests (`tests/test_runpod_launch.py`): the flag is required, watchdog() falls back to the launcher's own `created_at`, and `status` now reports a job that has already exited. Zero science obtained; the pilot itself was not run. |
+| 2026-09-07 | A | a5_r_train_extension (3 jobs: bdh_cq/plain on propagate, train_steps {1,2,4,8}, 3 seeds, 40000 steps) | RTX 4090, Secure Cloud | 4.15 | 3.07 | All 3 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Per-pod alive time 79.6, 79.9 and 89.8 minutes, computed from `runpod_state.jsonl` as the span between the launch row and the done row -- note `done` in that file is a BOOLEAN, not a timestamp, and reading it as one yields nonsense. Estimated at 5.35 GPU-hours / $3.96 from A1's measured 75.8 ms/step scaled by the 1.607 mean-R ratio; came in 22 percent under, because that ratio is an upper bound (ingest, data and the optimizer step do not scale with R). Second estimate in a row to land close, and the first to land under. Findings in section A5. |
 | 2026-09-06 | A | a4_convergence (9 jobs: 3 recurrence kinds x 3 seeds, 40000 steps) | RTX 4090, Secure Cloud | 13.62 | 10.08 | All 9 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Billed hours are per-pod alive time from `runpod_state.jsonl`, not the launcher's `print_status` figure, which still reports "$0.000 so far" when the API withholds `uptimeSeconds`. Estimated beforehand at 12.47 GPU-hours / $9.23 by taking the pilot's measured ms/step (plain 67.7, `attn_residual` 85.3, `init_skip` 81.1) rather than the manifest's profiled `est_gpu_minutes`; the estimate came in 9 percent low, the first cost prediction on this project to land close. Training was 9.22 of the 13.62 hours; the remaining 4.40 is pod boot (~6.5 min each) and the final R in {1,2,4,8,16,32} evaluation, which is markedly more expensive here than in A1 because `R=32` was added to the 16 mid-training checkpoints. About 1.0 GPU-hour (~$0.77) of the overhead was avoidable idle: see the row below. Findings in section A4. |
 | 2026-09-06 | A | a4_convergence, collection failure (no science lost, ~$0.77 wasted) | RTX 4090, Secure Cloud | ~1.0 | ~0.77 | Seven pods sat finished-but-uncollected for roughly 30 minutes. Two independent causes, both now fixed. (1) The completion watch polled for the absence of `RUNNING`, but `print_status` reports a finished-but-uncollected pod as `RUNNING` with a trailing "job exited 0, awaiting collect" -- so the watch could never fire on completion. Poll for the marker, not for the absence of `RUNNING`. (2) `collect` caught only `tarfile.TarError`, so when the local disk hit 100 percent mid-extract the resulting `OSError` (and, on a truncated download, `zlib.error`) propagated out of the loop and every run after it went uncollected -- while its pod kept billing. Now caught per-run with the pod deliberately left alive for retry, with two regression tests in `tests/test_runpod_launch.py` that were checked to fail against the old handler. The disk itself was freed twice over: package caches outside the repo (~8.7 GB, the correct fix) and 30 penultimate training checkpoints (3.6 GB, destructive and unnecessary -- every final checkpoint was kept, but those 30 are gone). |
 | 2026-09-06 | A | A1d convergence-onset analysis | none (CPU) | 0.0 | 0.00 | No new training and no new runs: A1's checkpoints already carried a mid-training evaluation every 2500 steps at R in {1, 4, 16} with diagnostics, 16 per run over 9 runs. A ~$2.50 step-sweep (1 kind, 3 seeds, cos_last checkpointed 8k-40k) was scoped and quoted to the user before that was checked, and then not run. Delivered instead as `convergence_onset_*` in `bdhx/results/aggregate.py`, so the table regenerates from `results/` rather than from a one-off script. Section A1d. |
