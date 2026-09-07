@@ -8,9 +8,12 @@
 #   looped_transformer   0.061  0.006  0.019
 #   bdh_cq               0.503  0.579  0.654
 #
-# Complete separation across 9 runs: bdh_cq's worst seed is 8x the best
-# baseline seed, at matched parameters and matched training FLOPs. The two
-# loop architectures generalize on orthogonal axes -- looped_transformer
+# Those are the 3-seed numbers this sweep was scoped from. A 5-seed repeat
+# (section A1e) has since revised them: the mean effect and the disjoint CIs
+# hold, but per-seed separation does NOT -- bdh_cq's worst seed is 0.192
+# against bdh's best of 0.180 once seeds 4 and 5 are in. Read A1e, not this
+# block, for the current numbers; the motivation for the sweep is unchanged.
+# The two loop architectures generalize on orthogonal axes -- looped_transformer
 # extrapolates in test-time compute (0.973 at R=8, trained to 4) and fails on
 # harder problems; bdh_cq does the reverse.
 #
