@@ -686,6 +686,81 @@ revised here: A1's 72 GPU-hours were dominated by its full evaluation grid
 (6 R values x 1000 episodes) rather than by training, and that grid is
 unchanged in the full sweeps. Profile before trusting a cheaper number.
 
+### A1c. compose, re-run on the fixed generator: nobody composes
+
+Full sweep, 9 jobs (3 models x 3 seeds, 40000 steps, `compose`, ~10M params),
+`configs/stage_a/a1c_compose_rerun.yaml`. All 9 exit 0 at step 40000, 0
+diverged, 0 relaunches. Tables in `reports/2026-09-07-a1c/`, copied to
+`docs/results/a1c/`.
+
+Gate first, since A1a's whole point was that the corpus was broken:
+`tools/task_ceiling.py --task compose` reports **1.000 target-in-context and
+1.000 oracle-solvable on every split** (train, interp, mild depth 3-4, strong
+depth 6-8), against pre-fix ceilings of 0.316 interp / 0.100 mild / 0.031
+strong. The corpus defect is gone. The null to beat is the guessing floor
+`1/n_examples_per_fn` = **0.125**, not `1/vocab`, exactly as the config
+pre-registered.
+
+**Nothing learns to compose.** Exact match at the final checkpoint, `interp`,
+R=1, bootstrap 95% CI:
+
+| model | depth 1 | depth 2 | final train loss |
+|-------|---------|---------|------------------|
+| bdh | 0.138 [0.116, 0.166] | 0.122 [0.104, 0.148] | 2.85, 3.15, 3.05 |
+| bdh_cq | 0.147 [0.124, 0.162] | 0.115 [0.108, 0.128] | 3.23, 3.45, 3.89 |
+| looped_transformer | 0.002 [0.000, 0.004] | 0.001 [0.000, 0.002] | 8.27, 8.36, 8.24 |
+
+Not one CI clears 0.125. `ln(vocab)` is 8.326.
+
+**The question A1c was launched to answer has a clean answer: it was not the
+corpus.** `looped_transformer` was 3/3 AT_CHANCE on A1's broken compose and
+is 3/3 AT_CHANCE here, on a corpus where every episode is solvable from its
+own demonstrations. Its final train loss sits at `ln(vocab)` on all three
+seeds. It did not learn a degenerate strategy; it did not leave the uniform
+prior at all.
+
+**`bdh` and `bdh_cq` fell into exactly the trap the config predicted.** Both
+leave the plateau decisively -- loss 2.8 to 3.9 against 8.326 -- so a
+loss-only reading would call them successes. Their accuracy is at the
+guessing floor. What they learned is the degenerate strategy the floor
+measures: emit the endpoint of one of the demonstrated paths, ignore which
+one the query asks for. This is why the config fixed the null at 0.125 before
+launch, and it is the second time on this project that "left the ln(vocab)
+plateau" has proved worthless as evidence of learning (the first was the A4
+pilot, where an accuracy-free `cos_last` target was satisfied by not
+learning).
+
+**The loop still hurts when the task is not learned.** `bdh_cq` degrades
+monotonically with test-time iterations on `interp` -- 0.131 at R=1, 0.119 at
+R=8, 0.079 at R=16, 0.003 at R=32 -- while `bdh`, which ignores R, is flat at
+0.130. Consistent with A4 and A5: extra iterations degrade a state that has
+nothing useful in it.
+
+**What this does and does not establish.** It establishes that
+`looped_transformer`'s compose failure is not attributable to the corpus,
+which is what A1a left open and what this sweep was for. It does **not**
+establish that `compose` is unlearnable, and the write-up should not say so:
+one task, ~10M params, 40000 steps, `final_answer` loss, one learning rate.
+`looped_transformer` learns `propagate` well under the same harness (A1: 0.97
+exact match at R=8), so its total failure here is compose-specific rather
+than a broken configuration -- but "compose-specific failure of this setup"
+and "architectural inability to compose" are different claims and only the
+first is supported. A learning-rate or loss ablation on compose is the honest
+next step if anyone wants the stronger claim.
+
+**Compose therefore still contributes no positive result to this project**,
+now for a defensible reason rather than a corpus artifact. Stage A's evidence
+base remains `propagate`.
+
+**Cost.** 5.95 GPU-hours, $4.40, against a 9.50 GPU-hour / $7.03 estimate:
+37 percent under. The estimate itself replaced the 36.0 GPU-hour / ~$26.6
+figure this file carried for A1c, which came from the manifest's profiled
+per-job minutes; the measured per-step cost on the fixed generator (bdh 32.9,
+looped_transformer 53.1, bdh_cq 69.5 ms/step) is roughly 6x cheaper, the same
+ratio A4 and A5 found. Per-pod wall clock varied 2.4x across identical work
+on the same GPU model (943s to 2258s of training for `looped_transformer`),
+which is host contention, not truncation: all 9 runs completed 40000 steps.
+
 ### A1d. When the loop stops converging: it is acquired while learning, and only by BDH-CQ
 
 Third follow-up, **zero GPU cost**, and it should have been the first: every A1
@@ -1127,13 +1202,12 @@ files the sweep had already produced.
 fixed but has never been run against a model, and the drift diagnosis, not the
 curriculum, is now the live hypothesis. In priority order:
 
-1. **A1c, `compose` re-run** (`configs/stage_a/a1c_compose_rerun.yaml`, 9 jobs
-   = 3 models x 3 seeds, 36.0 GPU-hours, ~$26.6 at RTX 4090 Secure). The
-   identical A1 arms on the fixed generator. This is the only way `compose`
-   re-enters the evidence base, and the cheapest way to find out whether
-   `looped_transformer` fails to compose or merely failed to learn from a
-   corpus in which 71 percent of answers were unreachable.
-   `tools/task_ceiling.py --task compose --min-train-solvable 0.99` gates it.
+1. ~~**A1c, `compose` re-run**~~ **Done, 2026-09-07, 5.95 GPU-hours / $4.40.
+   See section A1c.** Not the corpus: `looped_transformer` is 3/3 AT_CHANCE
+   on a fully solvable corpus too. `bdh` and `bdh_cq` leave the ln(vocab)
+   plateau but sit at the 0.125 guessing floor, having learned to emit a
+   demonstrated path endpoint. No model composes, so `compose` still
+   contributes no positive result -- now for a defensible reason.
 2. ~~**A4, convergence engineering**~~ **Done, 2026-09-06, 13.62 GPU-hours /
    $10.08. See section A4.** It raised `cos_last` at R=32 from 0.802 to 1.000
    and accuracy past `R_train_max` did *not* follow: exact match stays exactly
@@ -1156,10 +1230,23 @@ curriculum, is now the live hypothesis. In priority order:
    answered the question A2 was being kept for, so A2's remaining value is
    only its ordering question, at 24 jobs. Not worth it.
 
-(2), (3) and (4) are done. (1) is running as of 2026-09-07 (9 jobs,
-estimated 9.5 GPU-hours / $7.03 from measured per-step cost on the fixed
-generator, not the manifest's ~6x-conservative profile that produced the
-~$27 figure this list used to carry).
+All four are done. Stage A's evidence base is `propagate` alone: `compose`
+has now been run twice and yielded nothing either time, first because of the
+corpus and now because no model at this scale learns it.
+
+The open questions Stage A leaves, in the order they seem worth money:
+
+1. **Does dense training buy a usable range?** A5b shows generalization decays
+   with distance from a trained R, and A5 shows the boundary sits exactly at
+   `R_train_max`. Neither tested a densely trained model. Training on R in
+   {1,2,3,4,5,6,7,8} and testing the same grid would say whether density
+   produces a genuinely usable interval or just more isolated competences.
+   3 jobs, roughly the cost of A5.
+2. **Is `compose` learnable at all here?** A learning-rate and loss ablation
+   on one model, not a fourth full sweep. Only worth it if `compose` matters
+   to the conclusion, which on current evidence it does not.
+3. **A 5-seed repeat of the `propagate` Gate A finding**, per this file's own
+   convention, before anything in Stage A is called settled.
 The combined 8000-step pilot proposed here was run (section A1c/A4 pilots) and
 was worth its ~$1.15: it is what replaced the ~$40 A4 estimate with the
 measured ~$9 one, and what showed that an accuracy-free `cos_last` target is
@@ -1205,6 +1292,7 @@ Gate D finding: pending.
 | 2026-09-03 | A | Gate A diagnosis (binding, sanity_learnability + BDH acceptance runs) | none (4 CPU cores) | 0.0 | 0.00 | about 20 CPU jobs of 3000 steps each plus a standalone reference reproduction; see section A0 |
 | 2026-09-06 | A | a1c/a4 pilots (6 jobs, 1 seed, 8000 steps) | RTX 4090, Secure Cloud | ~1.6 | ~1.15 | All 6 exit 0, collected, pods terminated on collection; `get_pods()` confirmed zero remaining. Training wall clock 0.95 GPU-hours; the rest is boot, clone and pip per pod. Came in at a quarter of the $5.27 estimate because A1's profiled per-job minutes are about 6x conservative for training. Findings in section A1c/A4 above: A1c returned no signal (one-sided by design), A4 refuted its own premise and is worth more than the $40 sweep it was screening. |
 | 2026-09-06 | A | a1c/a4 pilot, first attempt (FAILED, no results) | RTX 4090, Secure Cloud | ~12.1 | ~8.93 | 6 pods launched without `--sweep-config-path`. `generated/` is gitignored, so every job died seconds after boot with FileNotFoundError on its own config. A crashed job still tars its output and sleeps, and RunPod keeps a pod allocated after its docker command exits, so all six billed at $0.74/hr until reaped by hand 2.2 hours later. The 90-minute `--max-wall-clock-minutes` cap did not fire: the API returned no `uptimeSeconds` for any of these pods, and watchdog() skipped every pod it could not time. `print_status` showed "$0.000 so far" throughout for the same reason. All three are fixed with regression tests (`tests/test_runpod_launch.py`): the flag is required, watchdog() falls back to the launcher's own `created_at`, and `status` now reports a job that has already exited. Zero science obtained; the pilot itself was not run. |
+| 2026-09-07 | A | a1c_compose_rerun (9 jobs: 3 models x 3 seeds, 40000 steps, fixed compose generator) | RTX 4090, Secure Cloud | 5.95 | 4.40 | All 9 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Estimated at 9.50 GPU-hours / $7.03 from per-step cost measured on the fixed generator (bdh 32.9, looped_transformer 53.1, bdh_cq 69.5 ms/step), which replaced this file's earlier 36.0 GPU-hour / ~$26.6 figure taken from the manifest's profiled minutes; came in 37 percent under that, and 84 percent under the original. Per-pod wall clock varied 2.4x on identical work (943s to 2258s of training for looped_transformer) -- host contention, not truncation; all 9 completed 40000 steps. Disk was cleared beforehand by deleting 12 penultimate `step_00039000.pt` checkpoints (1.44 GB), some of them inside the `checkpoints/checkpoints/` nesting left by the old double-nesting bug; every final checkpoint was kept and the delete asserted on the filename. Findings in section A1c. |
 | 2026-09-07 | A | A5b re-evaluation at R in {3,5,6,7} | none (CPU) | 0.0 | 0.00 | No new training and no new runs: `tools/reeval_checkpoint.py` rebuilds each A5 model from `metadata.json`'s resolved config and re-runs the trainer's own `run_evaluation` against the final checkpoints already on disk. 3 seeds x 6 R x 3 difficulties x 1000 episodes, ~27 minutes on CPU. R=4 and R=8 were re-evaluated deliberately as a reproduction check: 18 stored cells, 0 mismatches. Section A5b. |
 | 2026-09-07 | A | a5_r_train_extension (3 jobs: bdh_cq/plain on propagate, train_steps {1,2,4,8}, 3 seeds, 40000 steps) | RTX 4090, Secure Cloud | 4.15 | 3.07 | All 3 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Per-pod alive time 79.6, 79.9 and 89.8 minutes, computed from `runpod_state.jsonl` as the span between the launch row and the done row -- note `done` in that file is a BOOLEAN, not a timestamp, and reading it as one yields nonsense. Estimated at 5.35 GPU-hours / $3.96 from A1's measured 75.8 ms/step scaled by the 1.607 mean-R ratio; came in 22 percent under, because that ratio is an upper bound (ingest, data and the optimizer step do not scale with R). Second estimate in a row to land close, and the first to land under. Findings in section A5. |
 | 2026-09-06 | A | a4_convergence (9 jobs: 3 recurrence kinds x 3 seeds, 40000 steps) | RTX 4090, Secure Cloud | 13.62 | 10.08 | All 9 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Billed hours are per-pod alive time from `runpod_state.jsonl`, not the launcher's `print_status` figure, which still reports "$0.000 so far" when the API withholds `uptimeSeconds`. Estimated beforehand at 12.47 GPU-hours / $9.23 by taking the pilot's measured ms/step (plain 67.7, `attn_residual` 85.3, `init_skip` 81.1) rather than the manifest's profiled `est_gpu_minutes`; the estimate came in 9 percent low, the first cost prediction on this project to land close. Training was 9.22 of the 13.62 hours; the remaining 4.40 is pod boot (~6.5 min each) and the final R in {1,2,4,8,16,32} evaluation, which is markedly more expensive here than in A1 because `R=32` was added to the 16 mid-training checkpoints. About 1.0 GPU-hour (~$0.77) of the overhead was avoidable idle: see the row below. Findings in section A4. |
