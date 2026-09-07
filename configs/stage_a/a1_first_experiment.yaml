@@ -11,7 +11,16 @@ base: configs/base/default.yaml
 grid:
   model.name: [bdh, bdh_cq, looped_transformer]
   task.name: [compose, propagate]
-seeds: [1, 2, 3]            # raise to [1,2,3,4,5] for README-grade claims
+# Raised to 5 on 2026-09-07 for the propagate Gate A finding, per this
+# project's own convention that a README-grade claim needs 5 seeds. `seeds`
+# does not enter the config hash (training.seed is in HASH_EXCLUDED_FIELDS),
+# so seeds 4 and 5 land in the SAME cells as 1-3 rather than new ones -- which
+# is the whole point, and the reason this is edited here rather than copied
+# into a new sweep file whose `sweep.name` would change experiment.name and
+# with it the hash. Only the propagate arms were run at seeds 4-5; compose is
+# withdrawn (A1a) and its re-run learned nothing (A1c), so paying for two more
+# compose seeds would buy nothing.
+seeds: [1, 2, 3, 4, 5]
 overrides:
   model.params_target: 10_000_000
   model.recurrence.kind: plain
