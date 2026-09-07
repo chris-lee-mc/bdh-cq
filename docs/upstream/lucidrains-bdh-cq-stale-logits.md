@@ -1,9 +1,27 @@
 # Upstream report: a forward ending on a latent stage returns stale logits
 
 Status: drafted and verified against `lucidrains/bdh-cq` at `c246f890`
-(current HEAD as of 2026-09-06, version 0.0.20), NOT yet filed. This session
-could not attach the upstream repository with write access, so the text below
-is ready to paste as a GitHub issue or PR.
+(version 0.0.20), NOT yet filed.
+
+Re-verified 2026-09-07 by running the reproduction below against the pinned
+package installed in this project's venv. It still holds: the logits are
+byte-identical for reasoning_steps 1, 4 and 16, and `return_loss = True`
+correctly refuses the same call with "latent reasoning cannot be the final
+stage". The defect is live at that commit.
+
+The "breaks 8 of the 46 tests" claim under "Why the obvious fix is wrong" was
+established in an earlier session that could clone the upstream repo. It
+CANNOT be re-checked from this session and is reported on that earlier
+evidence, not on a check made today. Anyone filing this should re-run the
+upstream suite before asserting it.
+
+Why it is still unfiled: this workspace cannot reach `lucidrains/bdh-cq` at
+all. `add_repo` refuses cross-owner adds, the GitHub tools deny the
+repository as out of session scope, and `list_repos` returns only
+`chris-lee-mc` repositories -- the GitHub App is not installed on a third
+party's account and cannot be, since that requires admin rights there. No
+amount of permission granted on this side changes it. Filing needs a fork
+under an account that can push, or a human pasting the text below.
 
 This supersedes the looser wording of `PAPER_IMPLEMENTATION_GAPS.md` item 2.4.
 The important correction, found by testing rather than reading: a trailing
