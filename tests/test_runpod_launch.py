@@ -172,7 +172,7 @@ def test_launch_refuses_above_thresholds_without_allow_large_sweep(tmp_path):
     with pytest.raises(ValueError, match="allow-large-sweep"):
         launch(
             d,
-            git_ref="deadbeef",
+            git_ref="deadbeef" * 5,
             client=FakeRunpod(),
             state_path=tmp_path / "state.jsonl",
             sweep_config_path=SWEEP_YAML,
@@ -185,7 +185,7 @@ def test_launch_creates_pods_and_appends_state_before_returning(tmp_path):
     state_path = tmp_path / "state.jsonl"
     created = launch(
         d,
-        git_ref="deadbeef",
+        git_ref="deadbeef" * 5,
         max_concurrent=2,
         client=client,
         state_path=state_path,
@@ -207,7 +207,7 @@ def test_launch_dry_run_creates_no_pods(tmp_path):
     client = FakeRunpod()
     launch(
         d,
-        git_ref="deadbeef",
+        git_ref="deadbeef" * 5,
         client=client,
         state_path=tmp_path / "state.jsonl",
         dry_run=True,
@@ -358,7 +358,7 @@ def test_docker_args_never_contains_api_key():
         config_path="cfg.yaml",
         sweep_config_path=SWEEP_YAML,
     )
-    args = build_docker_args(rec, "deadbeef")
+    args = build_docker_args(rec, "deadbeef" * 5)
     assert "RUNPOD_API_KEY" not in args
     assert "h0_s1" in args and "cfg.yaml" in args
 
@@ -412,7 +412,7 @@ def test_docker_args_regenerates_the_sweep_when_sweep_config_path_is_set():
         config_path="generated/a1_first_experiment/exp_000.yaml",
         sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
     )
-    args = build_docker_args(rec, "deadbeef")
+    args = build_docker_args(rec, "deadbeef" * 5)
     assert "tools/generate_sweep.py configs/stage_a/a1_first_experiment.yaml" in args
     assert "--out generated/a1_first_experiment" in args
     # the regen step must run before run_experiment.py reads its output
@@ -439,7 +439,7 @@ def test_docker_args_refuses_a_record_without_a_sweep_config_path():
         config_path="cfg.yaml",
     )
     with pytest.raises(ValueError, match="sweep_config_path is required"):
-        build_docker_args(rec, "deadbeef")
+        build_docker_args(rec, "deadbeef" * 5)
 
 
 def test_relaunch_refuses_without_a_sweep_config_path(tmp_path):
@@ -1393,3 +1393,66 @@ def test_collect_leaves_the_pod_alive_when_its_tarball_is_corrupt(tmp_path):
     )
     assert result["pulled"] == []
     assert created[0].pod_id not in client.terminated
+
+
+def test_abbreviated_sha_is_rejected_before_any_pod_is_created():
+    """An abbreviated sha is not fetchable, and fails only on the pod.
+
+    The pod runs `git fetch origin <ref> && git checkout FETCH_HEAD`. Git
+    servers serve advertised refs plus FULL object names, so a 7-char
+    abbreviation dies with "couldn't find remote ref" -- while passing every
+    local git command, which is what makes it so easy to launch. Because the
+    fetch is `&&`-joined to the pip installs, the sweep regen and the training
+    command, the whole chain short-circuits: no job.log, EXIT_CODE 1, and a
+    pod that keeps billing because a crashed job still sleeps. 15 pods went
+    that way in one call before this guard existed.
+    """
+    import pytest
+
+    from tools.runpod_launch import require_fetchable_git_ref
+
+    with pytest.raises(ValueError, match="abbreviated sha"):
+        require_fetchable_git_ref("dc6bafb")
+
+
+def test_full_shas_and_branch_names_are_accepted():
+    """The guard must not block the two forms that DO work on a pod.
+
+    A full 40-hex object name is always fetchable, and a branch or tag name is
+    advertised by the server so it fetches too. Rejecting either would make
+    the guard worse than the bug.
+    """
+    from tools.runpod_launch import require_fetchable_git_ref
+
+    full = "dc6bafb64795509088333d167bdc70ce03d99b29"
+    assert require_fetchable_git_ref(full) == full
+    assert require_fetchable_git_ref("claude/bdh-cq-gate-a-runpod-wccvfu")
+    # A branch whose name happens to be short and hex-looking is still a name,
+    # but we cannot tell it from an abbreviation, so it is rejected: the false
+    # positive is cheap (rename or pass the sha), the false negative is 15 pods.
+    with pytest.raises(ValueError):
+        require_fetchable_git_ref("abcdef")
+
+
+def test_build_docker_args_refuses_an_abbreviated_sha():
+    """The guard has to sit where pods are actually created, not only in CLI
+    parsing: build_docker_args is the one choke point both launch() and
+    relaunch() pass through."""
+    import pytest
+
+    from tools.runpod_launch import PodRecord, build_docker_args
+
+    rec = PodRecord(
+        sweep="s",
+        exp="exp_000",
+        run_id="hash_s1",
+        pod_id=None,
+        gpu_type="NVIDIA GeForce RTX 4090",
+        cloud_type="SECURE",
+        max_seconds=600,
+        config_path="generated/s/exp_000.yaml",
+        name="bdhx-s-exp_000",
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
+    )
+    with pytest.raises(ValueError, match="abbreviated sha"):
+        build_docker_args(rec, "dc6bafb")

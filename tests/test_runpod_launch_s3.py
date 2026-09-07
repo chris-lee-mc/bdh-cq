@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.runpod_launch import PodRecord, build_docker_args, s3_env
 
-GIT_REF = "abcdef1"
+# A full 40-hex sha, not an abbreviation: the pod fetches this ref by name and
+# git servers do not serve abbreviated shas, so require_fetchable_git_ref
+# rejects them. See test_runpod_launch.py's abbreviated-sha tests.
+GIT_REF = "abcdef1" * 5 + "abcde"
 
 
 def record() -> PodRecord:

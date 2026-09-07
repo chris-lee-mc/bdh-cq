@@ -253,6 +253,40 @@ def latest_state_by_run_id(state_path: Path = DEFAULT_STATE_FILE) -> dict[str, d
 DEFAULT_HTTP_PORT = 8888
 
 
+def require_fetchable_git_ref(git_ref: str) -> str:
+    """Every path that creates a pod goes through this.
+
+    The pod runs `git fetch origin <git_ref> && git checkout FETCH_HEAD`, and
+    an ABBREVIATED sha is not fetchable: git servers only serve refs they
+    advertise plus full object names, so `git fetch origin dc6bafb` dies with
+    "couldn't find remote ref". Because that fetch is `&&`-joined to the pip
+    installs, the sweep regen and the training command, the whole chain
+    short-circuits: no job.log is ever written, EXIT_CODE is 1, and -- since a
+    crashed job still sleeps and RunPod keeps the pod allocated -- every pod
+    bills until something reaps it. That is exactly how 15 pods were created
+    and lost in one call on 2026-09-07 (cheap at $0.36 only because it was
+    caught in minutes).
+
+    A full 40-hex sha is always fetchable. A branch or tag name is fine too:
+    those ARE advertised. The one thing to reject is the hex abbreviation,
+    which looks correct, passes every local `git` command, and fails only on
+    the pod.
+    """
+    ref = (git_ref or "").strip()
+    if not ref:
+        raise ValueError("git_ref is required")
+    hexish = all(c in "0123456789abcdefABCDEF" for c in ref)
+    if hexish and len(ref) != 40:
+        raise ValueError(
+            f"git_ref {ref!r} looks like an abbreviated sha ({len(ref)} hex chars). "
+            "The pod fetches this ref by name and git servers do not serve "
+            "abbreviated shas, so every job would fail before writing a log "
+            "while its pod kept billing. Pass the full 40-character sha "
+            "(`git rev-parse HEAD`) or a branch name."
+        )
+    return ref
+
+
 def require_sweep_config_path(sweep_config_path: str) -> str:
     """Every path that creates a pod goes through this.
 
@@ -338,6 +372,9 @@ def build_docker_args(
     # no sweep_config_path is never one you want to launch, and quietly dropping
     # regen is exactly how the burn happened.
     require_sweep_config_path(cfg.sweep_config_path)
+    # Same reasoning, for the ref the fetch below uses: this is the single
+    # choke point every pod-creating path passes through.
+    require_fetchable_git_ref(git_ref)
     sweep_out_dir = os.path.dirname(cfg.config_path)
     regen = (
         f"python tools/generate_sweep.py {cfg.sweep_config_path} "
@@ -637,6 +674,8 @@ def relaunch(
 ) -> list[PodRecord]:
     if client is None:
         client = _default_client()
+
+    require_fetchable_git_ref(git_ref)
 
     # State rows written before this guard existed carry an empty
     # sweep_config_path; an explicit argument overrides whatever the row says,
