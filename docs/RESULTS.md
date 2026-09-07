@@ -686,6 +686,94 @@ revised here: A1's 72 GPU-hours were dominated by its full evaluation grid
 (6 R values x 1000 episodes) rather than by training, and that grid is
 unchanged in the full sweeps. Profile before trusting a cheaper number.
 
+### A6. At 30M the advantage inverts: BDH-CQ's win is a small-model effect
+
+9 jobs (3 models x 3 seeds, `propagate`, ~30M params, 40000 steps),
+`configs/stage_a/a6_scale_30m.yaml`, read against the 10M arms. All 9 exit 0
+at 40000 steps, 0 AT_CHANCE, 0 diverged. Parameter-matched at 29,917,440 /
+29,917,440 / 30,024,316. Tables in `reports/2026-09-07-a6/`.
+
+This sweep asked whether the `mild`-split advantage widens, holds or vanishes
+with scale. The pre-registered reading in the config called the third outcome
+"the one that would most change the write-up, which is why it is worth paying
+to find out". That is the outcome.
+
+**`mild`, distance 6, R=4, bootstrap 95% CI:**
+
+| arm | n | mean | 95% CI | per-seed |
+|---|---|---|---|---|
+| bdh 10M | 5 | 0.109 | [0.025, 0.236] | 0.038 0.000 0.062 0.360 0.086 |
+| bdh 30M | 3 | 0.003 | [0.000, 0.008] | 0.000 0.000 0.008 |
+| bdh_cq 10M | 5 | **0.806** | [0.569, 0.977] | 0.978 0.946 0.992 0.370 0.742 |
+| bdh_cq 30M | 3 | **0.197** | [0.022, 0.436] | 0.132 0.022 0.436 |
+| looped_tf 10M | 5 | 0.065 | [0.026, 0.104] | 0.122 0.012 0.038 0.122 0.030 |
+| looped_tf 30M | 3 | **0.522** | [0.226, 0.998] | 0.342 0.998 0.226 |
+
+Two changes clear this file's bar (disjoint CIs, gap > 0.05), and both are
+within-architecture across scale:
+
+- **BDH-CQ gets worse with scale.** 0.806 [0.569, 0.977] to 0.197 [0.022,
+  0.436]; disjoint, gap 0.133.
+- **The looped Transformer gets better with scale.** 0.065 [0.026, 0.104] to
+  0.522 [0.226, 0.998]; disjoint, gap 0.122.
+
+The same inversion appears at distance 8 (bdh_cq 0.114 -> 0.017,
+looped_transformer 0.000 -> 0.339).
+
+**What is NOT established.** At 30M the ordering appears reversed --
+looped_transformer 0.522 against bdh_cq 0.197 -- but those CIs overlap, so
+this file does not get to claim the reversal. Seed spread at 30M is extreme:
+looped_transformer scores 0.226, 0.342 and 0.998 on three seeds of an
+identical config. What the data supports is "BDH-CQ's advantage does not
+survive scaling", not "the looped Transformer is now better".
+
+The 30M arms are 3 seeds against the 10M arms' 5, and A1e is the standing
+warning about exactly that: three seeds there showed a separation that five
+seeds removed. Read the 30M numbers as provisional.
+
+**The R-cliff does not move at all.** `interp`, exact match:
+
+| arm | R=1 | R=2 | R=4 | R=8 | R=16 | R=32 |
+|---|---|---|---|---|---|---|
+| bdh_cq 10M | 0.998 | 0.997 | 0.987 | 0.000 | 0.000 | 0.000 |
+| bdh_cq 30M | 1.000 | 0.996 | 0.995 | 0.000 | 0.000 | 0.000 |
+
+Tripling the parameters changes nothing: still exactly 0.000 one step past
+`R_train_max`. This is the direct test of the "10M is too small" reading of
+A5 and A5b, and it fails. The extrapolation failure is not a capacity
+shortfall, which is what A5b's interpolation hole already implied and what
+this now confirms by experiment rather than by argument.
+
+**The fixed-depth baseline degrades with scale too** (0.109 -> 0.003), which
+is an ordinary overfitting signature: more capacity, a tighter fit to the
+training difficulties, less transfer. Worth stating because it means "bigger
+is worse on `mild`" is not unique to BDH-CQ, and any story about BDH-CQ's
+drop should account for the baseline showing the same direction.
+
+**What this costs the project's headline.** Section A1e established the
+`mild`-split advantage at 10M on 5 seeds and it stands there. A6 shows it
+does not generalize across scale: at 30M it is gone, and the architecture
+that gains instead is the plain looped Transformer. So the honest claim is
+now bounded -- "at ~10M parameters on `propagate`, BDH-CQ (community)
+generalizes to harder instances far better than either matched baseline" --
+and any suggestion that this is a property of the architecture rather than of
+that operating point is unsupported. The orthogonal-axes story (BDH-CQ
+generalizes in difficulty, the looped Transformer in test-time compute) is
+also a 10M statement: at 30M the looped Transformer does both better than
+BDH-CQ does either, while losing some of its own R-extrapolation
+(interp R=16: 0.832 at 10M, 0.390 at 30M).
+
+**Confound, stated in the config before launch and not controlled.** Training
+FLOPs are not matched across scales: the 30M arms saw the same 40000 steps,
+so they used ~3x the compute. That direction favours the 30M arms, which
+makes BDH-CQ's decline harder to explain away, not easier -- it got worse
+with more parameters AND more compute. The FLOP-matched version is a separate
+sweep with `training.steps` reduced.
+
+**Cost.** 13.64 GPU-hours, $10.09, against a 19.50 GPU-hour / $14.43
+estimate: 30 percent under, because the 3x-params-equals-3x-ms/step
+assumption was an upper bound as flagged.
+
 ### A1e. The Gate A finding at 5 seeds: it holds, and it is far noisier than 3 seeds showed
 
 6 jobs (2 extra seeds x 3 models, `propagate`, 40000 steps), launched from
@@ -1248,7 +1336,9 @@ the final checkpoint only; and `recurrence_convergence_<task>.csv` reports
 **Confidence:** the `propagate` Gate A finding is no longer provisional --
 it is at 5 seeds as of 2026-09-07 (section A1e), where it keeps disjoint
 bootstrap CIs against both baselines but loses the per-seed separation that
-3 seeds appeared to show. Everything else below is still 3 seeds per cell, as
+3 seeds appeared to show. It is also now bounded to its operating point:
+section A6 shows the advantage does not survive scaling to ~30M, where it
+inverts, so it is a ~10M result and must be stated as one. Everything else below is still 3 seeds per cell, as
 flagged. The `propagate` Gate A finding has disjoint bootstrap CIs and a large effect size, which is
 about as strong as a 3-seed result gets, but a `[1,2,3,4,5]`-seed repeat is
 the right bar before treating it as settled, per this file's own
@@ -1358,6 +1448,7 @@ Gate D finding: pending.
 | 2026-09-03 | A | Gate A diagnosis (binding, sanity_learnability + BDH acceptance runs) | none (4 CPU cores) | 0.0 | 0.00 | about 20 CPU jobs of 3000 steps each plus a standalone reference reproduction; see section A0 |
 | 2026-09-06 | A | a1c/a4 pilots (6 jobs, 1 seed, 8000 steps) | RTX 4090, Secure Cloud | ~1.6 | ~1.15 | All 6 exit 0, collected, pods terminated on collection; `get_pods()` confirmed zero remaining. Training wall clock 0.95 GPU-hours; the rest is boot, clone and pip per pod. Came in at a quarter of the $5.27 estimate because A1's profiled per-job minutes are about 6x conservative for training. Findings in section A1c/A4 above: A1c returned no signal (one-sided by design), A4 refuted its own premise and is worth more than the $40 sweep it was screening. |
 | 2026-09-06 | A | a1c/a4 pilot, first attempt (FAILED, no results) | RTX 4090, Secure Cloud | ~12.1 | ~8.93 | 6 pods launched without `--sweep-config-path`. `generated/` is gitignored, so every job died seconds after boot with FileNotFoundError on its own config. A crashed job still tars its output and sleeps, and RunPod keeps a pod allocated after its docker command exits, so all six billed at $0.74/hr until reaped by hand 2.2 hours later. The 90-minute `--max-wall-clock-minutes` cap did not fire: the API returned no `uptimeSeconds` for any of these pods, and watchdog() skipped every pod it could not time. `print_status` showed "$0.000 so far" throughout for the same reason. All three are fixed with regression tests (`tests/test_runpod_launch.py`): the flag is required, watchdog() falls back to the launcher's own `created_at`, and `status` now reports a job that has already exited. Zero science obtained; the pilot itself was not run. |
+| 2026-09-07 | A | a6_scale_30m (9 jobs: 3 models x 3 seeds, ~30M params, propagate) | RTX 4090, Secure Cloud | 13.64 | 10.09 | All 9 exit 0 at 40000 steps, collected, pods terminated; `get_pods()` confirmed zero remaining. Estimated 19.50 GPU-hours / $14.43 by treating 3x params as 3x ms/step, flagged in the config as an upper bound; came in 30 percent under. The session container restarted mid-sweep, killing every watch: no pod was billing idle at that moment, but the lesson is that watches do not survive a restart and the pods do. Disk needed 1.08 GB freed mid-sweep by deleting the A1c compose checkpoints -- 9 runs that all sat at or below the 0.125 guessing floor, so there was no signal in the weights to re-evaluate; every results.json kept, and the delete asserted the run was compose. 30M checkpoints are 693 MB per run, not the ~360 MB projected, because each keeps a penultimate and a final. Findings in section A6. |
 | 2026-09-07 | A | a1_first_experiment seeds 4-5, propagate arms only (6 jobs) | RTX 4090, Secure Cloud | 5.09 | 3.76 | All 6 exit 0 at 40000 steps, collected, pods terminated. Estimated 5.00 GPU-hours / $3.70; came in 2 percent over, the closest prediction on this project. Raises the propagate Gate A finding to 5 seeds so it is no longer flagged provisional -- and retracts the per-seed separation claim made at 3 seeds (section A1e). A FIRST attempt at this sweep, launched together with a6_scale_30m, lost all 15 pods to an abbreviated `--git-ref`: the pod's `git fetch origin <ref>` cannot resolve an abbreviated sha, and because that fetch is `&&`-joined to the pip installs and the training command, every job exited 1 with no job.log while its pod kept billing. $0.36, caught in minutes; guarded now by `require_fetchable_git_ref()` at `build_docker_args()` with three regression tests. |
 | 2026-09-07 | A | a1c_compose_rerun (9 jobs: 3 models x 3 seeds, 40000 steps, fixed compose generator) | RTX 4090, Secure Cloud | 5.95 | 4.40 | All 9 exit 0 at step 40000, collected, pods terminated; `get_pods()` confirmed zero remaining. Estimated at 9.50 GPU-hours / $7.03 from per-step cost measured on the fixed generator (bdh 32.9, looped_transformer 53.1, bdh_cq 69.5 ms/step), which replaced this file's earlier 36.0 GPU-hour / ~$26.6 figure taken from the manifest's profiled minutes; came in 37 percent under that, and 84 percent under the original. Per-pod wall clock varied 2.4x on identical work (943s to 2258s of training for looped_transformer) -- host contention, not truncation; all 9 completed 40000 steps. Disk was cleared beforehand by deleting 12 penultimate `step_00039000.pt` checkpoints (1.44 GB), some of them inside the `checkpoints/checkpoints/` nesting left by the old double-nesting bug; every final checkpoint was kept and the delete asserted on the filename. Findings in section A1c. |
 | 2026-09-07 | A | A5b re-evaluation at R in {3,5,6,7} | none (CPU) | 0.0 | 0.00 | No new training and no new runs: `tools/reeval_checkpoint.py` rebuilds each A5 model from `metadata.json`'s resolved config and re-runs the trainer's own `run_evaluation` against the final checkpoints already on disk. 3 seeds x 6 R x 3 difficulties x 1000 episodes, ~27 minutes on CPU. R=4 and R=8 were re-evaluated deliberately as a reproduction check: 18 stored cells, 0 mismatches. Section A5b. |
