@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.runpod_launch import PodRecord, build_docker_args, s3_env
 
-GIT_REF = "abcdef1"
+# A full 40-hex sha, not an abbreviation: the pod fetches this ref by name and
+# git servers do not serve abbreviated shas, so require_fetchable_git_ref
+# rejects them. See test_runpod_launch.py's abbreviated-sha tests.
+GIT_REF = "abcdef1" * 5 + "abcde"
 
 
 def record() -> PodRecord:
@@ -29,6 +32,9 @@ def record() -> PodRecord:
         max_seconds=600,
         config_path="generated/toy_sweep/exp_000.yaml",
         name="bdhx-toy_sweep-exp_000",
+        # build_docker_args refuses a record without one: a pod's clone has no
+        # generated/, so it regenerates the sweep from this committed path.
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
     )
 
 

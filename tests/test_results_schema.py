@@ -60,6 +60,68 @@ def test_results_roundtrip(results_dir):
     assert loaded.training_curve == "train_log.csv"
 
 
+def test_flush_dedupes_evaluations_keeping_the_latest_per_cell(results_dir):
+    """Regression test: found live on the real A1 sweep. A run relaunched
+    after it had already reached its final step (nothing left to train)
+    still runs run_experiment.py's unconditional final evaluation once
+    resumed -- which appends a second row for the same (step,
+    reasoning_steps, split, difficulty) cell on top of the one carried over
+    from the previous attempt's results.json. Left undeduped, a run_id can
+    end up recording the same cell 2-3x, and aggregate.py's build_summary()
+    would count each copy as an extra seed.
+    """
+    w = ResultsWriter(
+        results_dir,
+        run_id="run_abc",
+        config_hash="0123456789ab",
+        seed=1,
+        model="bdh",
+        task="compose",
+        params=10_000_000,
+    )
+    w.add_evaluation(
+        {
+            "step": 40000,
+            "reasoning_steps": 4,
+            "split": "mild",
+            "difficulty": {"depth": 3},
+            "n_episodes": 100,
+            "exact_match": 0.5,
+            "token_acc": 0.6,
+        }
+    )
+    # simulates the stale row carried over via `writer.results.evaluations.extend(previous.evaluations)`
+    w.add_evaluation(
+        {
+            "step": 40000,
+            "reasoning_steps": 4,
+            "split": "mild",
+            "difficulty": {"depth": 3},
+            "n_episodes": 100,
+            "exact_match": 0.51,  # a fresh eval this attempt; nearly identical but not bit-for-bit
+            "token_acc": 0.61,
+        }
+    )
+    w.add_evaluation(
+        {
+            "step": 40000,
+            "reasoning_steps": 8,  # a different cell -- must survive dedup untouched
+            "split": "mild",
+            "difficulty": {"depth": 3},
+            "n_episodes": 100,
+            "exact_match": 0.2,
+            "token_acc": 0.3,
+        }
+    )
+    w.flush()
+
+    loaded = ResultsWriter.load(results_dir)
+    assert len(loaded.evaluations) == 2
+    mild4 = next(e for e in loaded.evaluations if e.reasoning_steps == 4)
+    assert mild4.exact_match == 0.51  # the later (fresh) row wins, not the stale one
+    assert any(e.reasoning_steps == 8 for e in loaded.evaluations)
+
+
 def test_train_log_writer(results_dir):
     with TrainLogWriter(results_dir) as log:
         log.log(

@@ -193,8 +193,14 @@ class Trainer:
         if resume:
             path = self.latest_checkpoint()
             if path is None:
-                raise FileNotFoundError(f"--resume: no checkpoint under {self.ckpt_dir}")
-            self.load_checkpoint(path)
+                # A job's first launch always passes --resume (the launcher has
+                # no way to know in advance whether this is a first attempt or
+                # a retry after preemption), so "nothing to resume yet" is the
+                # common case, not an error. A checkpoint that DOES exist but
+                # is for a different config still raises, in load_checkpoint.
+                self.log(f"--resume: no checkpoint under {self.ckpt_dir}, starting fresh")
+            else:
+                self.load_checkpoint(path)
 
     # -- data --------------------------------------------------------------
     def train_difficulties(self) -> list[dict]:

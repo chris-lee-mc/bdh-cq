@@ -35,15 +35,21 @@ def get_rng_states() -> dict[str, Any]:
 
 
 def set_rng_states(states: dict[str, Any]) -> None:
+    # `torch.set_rng_state`/`set_rng_state_all` require a CPU ByteTensor. A
+    # checkpoint loaded with `map_location="cuda"` (Trainer.load_checkpoint
+    # maps the whole payload to the training device) hands us RNG-state
+    # tensors already on the GPU, which torch rejects with the misleading
+    # message "RNG state must be a torch.ByteTensor" -- force CPU here so
+    # the map_location used for the rest of the checkpoint can't affect it.
     if states.get("python") is not None:
         random.setstate(tuple(states["python"]))
     if states.get("numpy") is not None:
         np.random.set_state(states["numpy"])
     if states.get("torch") is not None:
-        torch.set_rng_state(torch.as_tensor(states["torch"], dtype=torch.uint8))
+        torch.set_rng_state(torch.as_tensor(states["torch"], dtype=torch.uint8).cpu())
     cuda = states.get("cuda")
     if cuda is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([torch.as_tensor(s, dtype=torch.uint8) for s in cuda])
+        torch.cuda.set_rng_state_all([torch.as_tensor(s, dtype=torch.uint8).cpu() for s in cuda])
 
 
 def task_rng(task_seed: int, split: str, index: int) -> np.random.Generator:

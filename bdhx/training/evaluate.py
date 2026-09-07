@@ -89,9 +89,18 @@ def group_by_difficulty(episodes: list[Episode]) -> list[tuple[dict, list[Episod
 
 
 def reduced_reasoning_steps(cfg) -> list[int]:
-    """The intermediate-checkpoint depth list, [1, 4, 16] restricted to the config."""
+    """The intermediate-checkpoint depth list, restricted to `reasoning_steps`.
+
+    Defaults to `INTERMEDIATE_REASONING_STEPS`; `evaluation.intermediate_
+    reasoning_steps` overrides it. The intersection is deliberate in both
+    cases -- a mid-training row at an R the final evaluation never visits
+    cannot be compared to anything -- and an empty intersection falls back to
+    the shallowest configured depth rather than skipping the checkpoint.
+    """
     configured = list(cfg.evaluation.reasoning_steps)
-    reduced = [r for r in INTERMEDIATE_REASONING_STEPS if r in configured]
+    requested = getattr(cfg.evaluation, "intermediate_reasoning_steps", None)
+    wanted = list(requested) if requested else list(INTERMEDIATE_REASONING_STEPS)
+    reduced = [r for r in wanted if r in configured]
     return reduced or configured[:1]
 
 

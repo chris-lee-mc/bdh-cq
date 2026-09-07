@@ -182,6 +182,65 @@ def test_target_correctness_compose():
                 assert found
 
 
+# -- test_solvable_from_demonstrations ---------------------------------------
+#
+# `test_target_correctness_compose` above checks the target against the hidden
+# bijections in `extras`, which no model sees.  These check the property a model
+# actually needs: that the answer can be derived from the demonstrations.
+
+
+def _chain_from_demonstrations(episode):
+    """Walk the query forward through the demonstrated pairs; None if it breaks."""
+    demo = {int(inp[0]): int(out[0]) for inp, out in episode.demonstrations}
+    cur = int(episode.query[-1])
+    for _ in range(int(episode.difficulty["depth"])):
+        if cur not in demo:
+            return None
+        cur = demo[cur]
+    return cur
+
+
+def test_compose_every_episode_is_solvable_from_its_demonstrations():
+    task = ComposeTask()
+    rng = np.random.default_rng(17)
+    for diff in _all_difficulties(task):
+        for _ in range(50):
+            ep = task.sample(rng, diff)
+            assert _chain_from_demonstrations(ep) == int(ep.target[0]), diff
+
+
+def test_compose_demonstrations_are_distinct_per_function():
+    """Sampling without replacement: no function wastes a demonstration on a repeat."""
+    task = ComposeTask()
+    rng = np.random.default_rng(19)
+    for depth in (1, 2, 4, 8):
+        ep = task.sample(rng, {"depth": depth})
+        inputs = [int(inp[0]) for inp, _ in ep.demonstrations]
+        assert len(inputs) == len(set(inputs))
+        assert len(inputs) == depth * task.n_examples_per_fn
+
+
+def test_compose_legacy_distribution_is_mostly_unsolvable():
+    """The pre-fix generator, kept behind a flag, and why the flag defaults to on.
+
+    A1's parameters explicitly: 4 examples of a domain of 8, drawn with
+    replacement per function, query drawn independently.
+    """
+    task = ComposeTask(n_examples_per_fn=4, domain_size=8, guarantee_solvable=False)
+    rng = np.random.default_rng(23)
+    solved = sum(
+        _chain_from_demonstrations(task.sample(rng, {"depth": 2})) is not None for _ in range(500)
+    )
+    assert solved / 500 < 0.3  # analytic value at depth 2 is 0.171
+
+
+def test_compose_n_examples_never_exceeds_the_domain():
+    task = ComposeTask(n_examples_per_fn=32, domain_size=8)
+    rng = np.random.default_rng(29)
+    ep = task.sample(rng, {"depth": 2})
+    assert len(ep.demonstrations) == 2 * 8
+
+
 def _brute_order(items, x, y):
     idx = {int(v): i for i, v in enumerate(items)}
     return LT if idx[x] < idx[y] else GT
@@ -256,3 +315,57 @@ def test_nested_program_uses_five_primitives():
         ep = task.sample(rng, {"depth": 3})
         seen.update(ep.extras["program"])
     assert seen == set(PRIMITIVES.keys())
+
+
+# -- query-dependence (RESULTS.md A1a, finding 5 of the pre-launch review) ----
+
+
+def _complete_paths(episode):
+    """Every length-d path through the demonstration graph, from any start."""
+    demo = {int(inp[0]): int(out[0]) for inp, out in episode.demonstrations}
+    depth = int(episode.difficulty["depth"])
+    starts = set(demo) - set(demo.values())
+    paths = []
+    for start in starts:
+        cur, ok = start, True
+        for _ in range(depth):
+            if cur not in demo:
+                ok = False
+                break
+            cur = demo[cur]
+        if ok:
+            paths.append(cur)
+    return paths
+
+
+def test_compose_answer_cannot_be_read_off_without_the_query():
+    """Regression: the first `guarantee_solvable` made the query redundant.
+
+    Demonstrating each function on the chain input plus unrelated distractors
+    leaves the distractors dead-ending, so the chain was the only complete
+    length-d path -- unique in 99.4 percent of depth-8 episodes, so a model
+    could emit the answer without reading x at all. Each function is now
+    demonstrated on the images of the previous one's inputs, so there are as
+    many complete paths as demonstrations per function.
+    """
+    task = ComposeTask()
+    rng = np.random.default_rng(31)
+    for depth in (1, 2, 4, 8):
+        for _ in range(20):
+            ep = task.sample(rng, {"depth": depth})
+            paths = _complete_paths(ep)
+            assert len(paths) == task.n_examples_per_fn, (depth, len(paths))
+            assert int(ep.target[0]) in paths
+
+
+def test_compose_guess_floor_is_one_over_the_demonstrated_paths():
+    """The null to score against, and it is not 1/vocab."""
+    task = ComposeTask()
+    assert task.guess_floor(8) == pytest.approx(1.0 / 8)
+    assert ComposeTask(n_examples_per_fn=4).guess_floor(8) == pytest.approx(0.25)
+    rng = np.random.default_rng(37)
+    for depth in (1, 8):
+        endpoints = {
+            len(set(_complete_paths(task.sample(rng, {"depth": depth})))) for _ in range(50)
+        }
+        assert endpoints == {task.n_examples_per_fn}

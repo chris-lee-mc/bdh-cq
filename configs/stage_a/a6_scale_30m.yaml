@@ -1,0 +1,84 @@
+# Stage A, experiment A6: does the BDH-CQ advantage grow with scale?
+#
+# A1's propagate arms at ~10M params produced this project's one large
+# positive result, on the `mild` split (harder than anything trained on), at
+# R = R_train_max = 4, exact match per seed:
+#
+#   bdh (no loop)        0.019  0.002  0.031
+#   looped_transformer   0.061  0.006  0.019
+#   bdh_cq               0.503  0.579  0.654
+#
+# Those are the 3-seed numbers this sweep was scoped from. A 5-seed repeat
+# (section A1e) has since revised them: the mean effect and the disjoint CIs
+# hold, but per-seed separation does NOT -- bdh_cq's worst seed is 0.192
+# against bdh's best of 0.180 once seeds 4 and 5 are in. Read A1e, not this
+# block, for the current numbers; the motivation for the sweep is unchanged.
+# The two loop architectures generalize on orthogonal axes -- looped_transformer
+# extrapolates in test-time compute (0.973 at R=8, trained to 4) and fails on
+# harder problems; bdh_cq does the reverse.
+#
+# This sweep asks the one question that could make that finding bigger rather
+# than merely firmer: does the mild-split gap WIDEN with scale? It is
+# deliberately NOT a test of the R-extrapolation failure, which three
+# independent results already rule capacity out of:
+#
+#   - propagate is saturated at 10M (bdh 1.000 on interp, bdh_cq 0.99
+#     in-range), so there is no headroom for more parameters to buy.
+#   - A5b: the SAME weights score 0.99 at R=4, 0.233 at R=6 and 0.99 at R=8.
+#     Capacity cannot explain a hole between two things a model does
+#     perfectly.
+#   - looped_transformer extrapolates to R=16 at 9,965,316 params, slightly
+#     FEWER than bdh_cq's 10,010,880. The capability exists at this scale.
+#
+# Everything matches a1_first_experiment except params_target. The 10M arms
+# are the reference and are already on disk, so this is 9 jobs, not 18.
+#
+# Read the mild split at R=4. Three outcomes, all informative:
+#   - gap widens          -> the advantage is a scaling property, and the
+#                            next question is where it saturates.
+#   - gap holds           -> a fixed architectural advantage, still the
+#                            project's headline, now at two scales.
+#   - gap narrows         -> the 10M result is a small-model artifact and
+#                            should be reported as one. This is the outcome
+#                            that would most change the write-up, which is
+#                            why it is worth paying to find out.
+#
+# Cost, from per-step cost measured on propagate at 10M (bdh 54.4,
+# looped_transformer 50.7, bdh_cq 75.8 ms/step). Compute per step scales
+# roughly with parameter count for these models, so 3x params is taken as 3x
+# ms/step; that is an upper bound, because data loading, the optimizer step
+# and the eval grid do not all scale. Estimated per-job pod minutes are
+# therefore ~119 (bdh), ~158 (bdh_cq) and ~113 (looped_transformer), giving
+# 19.5 GPU-hours and about $14.4 at the 4090 Secure rate, ~$18.8 with the
+# 1.3x contingency. If the 3x factor proves conservative, as the 1.607 factor
+# did for A5, it will land under.
+sweep:
+  name: a6_scale_30m
+  stage: A
+  description: >
+    A1's three propagate arms at ~30M params instead of ~10M: does the
+    bdh_cq advantage on the mild split widen, hold, or vanish with scale?
+base: configs/base/default.yaml
+grid:
+  model.name: [bdh, bdh_cq, looped_transformer]
+  task.name: [propagate]
+seeds: [1, 2, 3]
+overrides:
+  # The one manipulation. Everything below matches a1_first_experiment.yaml.
+  model.params_target: 30_000_000
+  model.recurrence.kind: plain
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 40000
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+  evaluation.diagnostics: true
+notes: >
+  Training FLOPs are NOT matched to the 10M arms and deliberately so: the
+  question is what a bigger model does with the same training recipe, not
+  what a fixed compute budget buys. Say that plainly in any write-up. If a
+  reviewer wants the FLOP-matched version, that is a separate sweep with
+  training.steps reduced, not a reinterpretation of this one.

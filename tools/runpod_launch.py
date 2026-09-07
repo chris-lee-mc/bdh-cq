@@ -29,6 +29,13 @@ upload. Credentials are forwarded from the launcher's own environment (see
 `s3_env`), never stored in a config or the state file. Untested against a real
 bucket: no S3 credentials exist for this project yet.
 
+Community Cloud showed a third failure mode this launcher has to plan for,
+distinct from both of the above and from ordinary preemption: a pod stuck at
+desiredStatus=RUNNING, uptimeSeconds=0, no exposed ports, indefinitely --
+the container simply never starts. watchdog() cannot catch this (uptime
+never exceeds anything because it never leaves 0); reap_stuck_boots() does,
+on a separate boot-side grace period.
+
 Usage:
     python tools/runpod_launch.py estimate generated/a1_first_experiment
     python tools/runpod_launch.py launch generated/a1_first_experiment \\
@@ -36,6 +43,7 @@ Usage:
     python tools/runpod_launch.py status
     python tools/runpod_launch.py relaunch generated/a1_first_experiment
     python tools/runpod_launch.py watchdog
+    python tools/runpod_launch.py reap-stuck-boots
     python tools/runpod_launch.py collect generated/a1_first_experiment --out results/
     python tools/runpod_launch.py reap --prefix bdhx-a1_first_experiment
 """
@@ -46,6 +54,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -58,6 +67,22 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bdhx.config import PROJECT_ROOT
+
+
+def _default_client():
+    """The real `runpod` module, with `api_key` set from RUNPOD_API_KEY.
+
+    The SDK does NOT auto-read RUNPOD_API_KEY from the environment (verified
+    against the live API: every `client=None` call site failed with
+    "No API key provided" until this was added, even with the env var set).
+    RUNPOD.md section 10 flagged this as unverified; it is now verified false.
+    """
+    import runpod
+
+    if not runpod.api_key:
+        runpod.api_key = os.environ.get("RUNPOD_API_KEY")
+    return runpod
+
 
 DEFAULT_STATE_FILE = PROJECT_ROOT / "runpod_state.jsonl"
 DEFAULT_RATES_FILE = PROJECT_ROOT / "configs" / "runpod_rates.yaml"
@@ -192,6 +217,8 @@ class PodRecord:
     config_path: str
     created_at: float = field(default_factory=time.time)
     name: str = ""
+    sweep_config_path: str = ""
+    done: bool = False
 
 
 def append_state(record: PodRecord, state_path: Path = DEFAULT_STATE_FILE) -> None:
@@ -224,6 +251,71 @@ def latest_state_by_run_id(state_path: Path = DEFAULT_STATE_FILE) -> dict[str, d
 
 
 DEFAULT_HTTP_PORT = 8888
+
+
+def require_fetchable_git_ref(git_ref: str) -> str:
+    """Every path that creates a pod goes through this.
+
+    The pod runs `git fetch origin <git_ref> && git checkout FETCH_HEAD`, and
+    an ABBREVIATED sha is not fetchable: git servers only serve refs they
+    advertise plus full object names, so `git fetch origin dc6bafb` dies with
+    "couldn't find remote ref". Because that fetch is `&&`-joined to the pip
+    installs, the sweep regen and the training command, the whole chain
+    short-circuits: no job.log is ever written, EXIT_CODE is 1, and -- since a
+    crashed job still sleeps and RunPod keeps the pod allocated -- every pod
+    bills until something reaps it. That is exactly how 15 pods were created
+    and lost in one call on 2026-09-07 (cheap at $0.36 only because it was
+    caught in minutes).
+
+    A full 40-hex sha is always fetchable. A branch or tag name is fine too:
+    those ARE advertised. The one thing to reject is the hex abbreviation,
+    which looks correct, passes every local `git` command, and fails only on
+    the pod.
+    """
+    ref = (git_ref or "").strip()
+    if not ref:
+        raise ValueError("git_ref is required")
+    hexish = all(c in "0123456789abcdefABCDEF" for c in ref)
+    if hexish and len(ref) != 40:
+        raise ValueError(
+            f"git_ref {ref!r} looks like an abbreviated sha ({len(ref)} hex chars). "
+            "The pod fetches this ref by name and git servers do not serve "
+            "abbreviated shas, so every job would fail before writing a log "
+            "while its pod kept billing. Pass the full 40-character sha "
+            "(`git rev-parse HEAD`) or a branch name."
+        )
+    return ref
+
+
+def require_sweep_config_path(sweep_config_path: str) -> str:
+    """Every path that creates a pod goes through this.
+
+    generated/ is gitignored, so a pod's fresh clone never has the expanded
+    exp_NNN.yaml on disk; build_docker_args() regenerates it from the source
+    sweep YAML, and only when this is set. Launching without it fails every
+    job seconds after boot with FileNotFoundError -- and because a crashed job
+    still tars its output and sleeps, and RunPod keeps a pod allocated after
+    its docker command exits, the pods bill on regardless. That cost ~$8.93
+    once (RESULTS.md compute ledger, 2026-09-06).
+
+    `launch()` validated its own argument, but `relaunch()` builds PodRecords
+    straight from the state file and calls create_pod() itself, so it
+    inherited nothing -- and the state file still holds pre-guard rows with
+    the field empty, which made the burn one `relaunch` command away from
+    happening again.
+    """
+    if not sweep_config_path:
+        raise ValueError(
+            "sweep_config_path is required: generated/ is gitignored, so the "
+            "pod regenerates exp_NNN.yaml from the source sweep YAML"
+        )
+    if not (PROJECT_ROOT / sweep_config_path).exists():
+        raise ValueError(
+            f"sweep_config_path {sweep_config_path!r} does not exist in the repo; "
+            "the pod resolves it relative to its own clone, so it must be a "
+            "committed path"
+        )
+    return sweep_config_path
 
 
 def build_docker_args(
@@ -269,6 +361,25 @@ def build_docker_args(
             f"--run-id {cfg.run_id} --dest {out_dir} --config {cfg.config_path} && "
         )
         sync = f"--sync-bucket {s3_bucket} "
+    # generated/ is gitignored (it is generated output, not source), so a
+    # fresh clone never has cfg.config_path on disk. Found live: the first
+    # real sweep job failed with FileNotFoundError on exactly this path.
+    # generate_sweep.py is a pure function of its source YAML (verified: two
+    # runs from the same commit produce byte-identical output), so
+    # regenerating it on the pod reproduces the same exp_NNN.yaml files
+    # rather than needing to transfer them.
+    # Raise rather than emit a command without the regen step: a PodRecord with
+    # no sweep_config_path is never one you want to launch, and quietly dropping
+    # regen is exactly how the burn happened.
+    require_sweep_config_path(cfg.sweep_config_path)
+    # Same reasoning, for the ref the fetch below uses: this is the single
+    # choke point every pod-creating path passes through.
+    require_fetchable_git_ref(git_ref)
+    sweep_out_dir = os.path.dirname(cfg.config_path)
+    regen = (
+        f"python tools/generate_sweep.py {cfg.sweep_config_path} "
+        f"--out {sweep_out_dir} --max-gpu-hours 1e9 && "
+    )
     return (
         "bash -lc '"
         "set -uo pipefail; "
@@ -277,10 +388,25 @@ def build_docker_args(
         "> /workspace/http.log 2>&1 & "
         "cd /workspace; "
         f"if [ ! -d repo ]; then git clone --depth 200 {REPO_URL} repo; fi; "
-        f"cd repo && git fetch origin {git_ref} && git checkout {git_ref} && "
+        # `git checkout {git_ref}` (the ref's own name) only works when git_ref
+        # is a commit SHA (whose object is present after any fetch) or when a
+        # local/remote-tracking ref with that exact name already exists. A
+        # plain `git clone --depth N` defaults to --single-branch, so it never
+        # creates a tracking ref for any branch but the remote's default one;
+        # `git fetch origin <branch>` on its own only updates FETCH_HEAD, not
+        # refs/remotes/origin/<branch>. So passing a branch name here used to
+        # fail with "pathspec did not match any file(s)" on every fresh pod,
+        # which -- because this whole chain is `&&`-joined into one big
+        # semicolon-separated statement -- silently skipped straight past both
+        # pip installs to the training command, crashing every job with
+        # ModuleNotFoundError instead of a git error. FETCH_HEAD always
+        # resolves after `git fetch origin <ref>`, whether ref is a branch,
+        # tag, or SHA.
+        f"cd repo && git fetch origin {git_ref} && git checkout FETCH_HEAD && "
         f"{'cd ' + REPO_SUBDIR + ' && ' if REPO_SUBDIR else ''}"
         'pip install -q -e ".[gpu]" && '
         'pip install -q "bdh-cq @ git+https://github.com/lucidrains/bdh-cq@c246f890"; '
+        f"{regen}"
         f"{fetch}"
         f"timeout --signal=TERM {cfg.max_seconds}s python tools/run_experiment.py "
         f"--config {cfg.config_path} --run-id {cfg.run_id} --resume "
@@ -349,9 +475,22 @@ def launch(
     client=None,
     dry_run: bool = False,
     s3_bucket: str | None = None,
+    sweep_config_path: str = "",
 ) -> list[PodRecord]:
+    """`sweep_config_path` (e.g. "configs/stage_a/a1_first_experiment.yaml") is
+    the source YAML `generated_dir` was expanded from. `generated/` is
+    gitignored, so a pod's fresh clone never has the generated exp_NNN.yaml
+    files on disk; passing this lets build_docker_args() regenerate them on
+    the pod (generate_sweep.py is a pure function of this file, verified
+    deterministic). Omit it only for a generated_dir the pod can reach some
+    other way -- every job launched without it will fail with
+    FileNotFoundError on cfg.config_path, which is exactly what happened the
+    first time this project tried to launch a real sweep.
+    """
     if client is None:
-        import runpod as client
+        client = _default_client()
+
+    require_sweep_config_path(sweep_config_path)
 
     generated_dir = Path(generated_dir)
     sweep = generated_dir.name
@@ -371,6 +510,8 @@ def launch(
     max_seconds = max_wall_clock_minutes * 60
 
     created: list[PodRecord] = []
+    failed: list[tuple[str, str]] = []
+    launched_this_call = 0
     for job in jobs:
         if job.run_id in existing and existing[job.run_id].get("pod_id"):
             continue  # already launched (or queued) this run_id; use relaunch for retries
@@ -387,30 +528,46 @@ def launch(
             max_seconds=max_seconds,
             config_path=config_path,
             name=name,
+            sweep_config_path=sweep_config_path,
         )
-        if len(created) >= slots or dry_run:
+        if launched_this_call >= slots or dry_run:
             append_state(rec, state_path)  # QUEUED: no pod_id yet
             created.append(rec)
             continue
         docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
-        pod = client.create_pod(
-            name=name,
-            image_name=image,
-            gpu_type_id=gpu_type,
-            cloud_type=cloud_type,
-            gpu_count=1,
-            container_disk_in_gb=20,
-            docker_args=_gql_escape(docker_args),
-            ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
-            env={
-                "RUN_ID": rec.run_id,
-                "MAX_SECONDS": str(max_seconds),
-                **s3_env(s3_bucket),
-            },
-        )
+        try:
+            pod = client.create_pod(
+                name=name,
+                image_name=image,
+                gpu_type_id=gpu_type,
+                cloud_type=cloud_type,
+                gpu_count=1,
+                container_disk_in_gb=20,
+                docker_args=_gql_escape(docker_args),
+                ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
+                env={
+                    "RUN_ID": rec.run_id,
+                    "MAX_SECONDS": str(max_seconds),
+                    **s3_env(s3_bucket),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - one job's provisioning failure must not sink the batch
+            # Queued, not dropped: relaunch() retries it (e.g. transient GPU
+            # capacity contention -- observed repeatedly during this
+            # project's own verification). Reported via `failed`, not raised,
+            # so the rest of the sweep still launches.
+            append_state(rec, state_path)
+            created.append(rec)
+            failed.append((job.run_id, str(e)))
+            continue
         rec.pod_id = pod["id"] if isinstance(pod, dict) else pod
         append_state(rec, state_path)  # cost-safety rule: append BEFORE moving on
         created.append(rec)
+        launched_this_call += 1
+    if failed:
+        print(f"WARNING: {len(failed)} job(s) failed to provision, queued for relaunch:")
+        for run_id, msg in failed:
+            print(f"  {run_id}: {msg}")
     return created
 
 
@@ -428,20 +585,58 @@ def classify(pod: dict | None) -> str:
     return status or "UNKNOWN"
 
 
-def status(state_path: Path = DEFAULT_STATE_FILE, client=None) -> list[dict]:
+def status(
+    state_path: Path = DEFAULT_STATE_FILE,
+    client=None,
+    check_exit_codes: bool = False,
+    fetch=None,
+) -> list[dict]:
     if client is None:
-        import runpod as client
+        client = _default_client()
+
+    try:
+        live_ids = {p.get("id") for p in client.get_pods()}
+    except Exception:  # noqa: BLE001 - no listing means we cannot tell gone from unreachable
+        live_ids = None
 
     rows = []
     for rec in latest_state_by_run_id(state_path).values():
+        if rec.get("done"):
+            # Collected successfully. There is no separate "terminated
+            # cleanly" signal from the RunPod API -- a pod that no longer
+            # resolves via get_pod() looks identical whether it finished and
+            # was reaped or it simply vanished, so without this explicit
+            # marker a collected job reads back as MISSING and relaunch()
+            # retrains it from scratch. Found live: three already-collected
+            # A1 jobs got brand-new pods on the very next relaunch() call.
+            rows.append({**rec, "state": "DONE"})
+            continue
         if not rec.get("pod_id"):
             rows.append({**rec, "state": "QUEUED"})
             continue
         try:
             pod = client.get_pod(rec["pod_id"])
-        except Exception:  # noqa: BLE001 - a not-found pod means MISSING, not a crash
+        except Exception:  # noqa: BLE001 - could be "not found", could be the API
             pod = None
-        rows.append({**rec, "state": classify(pod), "pod": pod})
+        # `get_pod` failing is ambiguous: the pod may be gone, or the API may be
+        # having a moment. The account-wide listing disambiguates -- an id
+        # absent from a listing that itself succeeded really is gone.
+        unreachable = pod is None and live_ids is None
+        # A transient API error is indistinguishable from a terminated pod at
+        # this layer, and calling it MISSING made relaunch() create a SECOND pod
+        # for the same run_id -- whose new state row then erased the original's
+        # pod_id, leaving a live pod that watchdog, status, collect and
+        # reap_stuck_boots can no longer see and only `reap --prefix` can find.
+        # UNKNOWN is excluded from relaunch, so the worst case is a retry
+        # deferred by one poll rather than a pod nobody is tracking.
+        state = "UNKNOWN" if unreachable else classify(pod)
+        row = {**rec, "state": state, "pod": pod}
+        if row["state"] == "RUNNING" and check_exit_codes:
+            try:
+                row["exit_code"] = job_exit_code(rec["pod_id"], rec["run_id"], fetch=fetch)
+            except Exception:  # noqa: BLE001 - one pod must not empty the table
+                row["exit_code"] = None
+        rows.append(row)
     return rows
 
 
@@ -449,9 +644,19 @@ def print_status(rows: list[dict]) -> None:
     for r in rows:
         cost = ""
         pod = r.get("pod")
-        if pod and pod.get("costPerHr") is not None and pod.get("uptimeSeconds") is not None:
-            cost = f"  ${float(pod['costPerHr']) * float(pod['uptimeSeconds']) / 3600:.3f} so far"
-        print(f"{r['run_id']:40s} {r['state']:10s} pod={r.get('pod_id') or '-'}{cost}")
+        elapsed = elapsed_seconds(r) if pod else None
+        if pod and pod.get("costPerHr") is not None and elapsed is not None:
+            # `elapsed_seconds` falls back to time since creation, so a pod the
+            # API reports no uptime for still shows a real running cost rather
+            # than "$0.000 so far".
+            estimated = "" if pod.get("uptimeSeconds") is not None else " (est.)"
+            cost = f"  ${float(pod['costPerHr']) * elapsed / 3600:.3f} so far{estimated}"
+        exited = ""
+        if r.get("exit_code") is not None:
+            # RUNNING here means the POD is allocated, not that the job is: a
+            # pod whose job exited keeps billing until collect or reap ends it.
+            exited = f"  job exited {r['exit_code']}, awaiting collect"
+        print(f"{r['run_id']:40s} {r['state']:10s} pod={r.get('pod_id') or '-'}{cost}{exited}")
 
 
 def relaunch(
@@ -465,11 +670,26 @@ def relaunch(
     state_path: Path = DEFAULT_STATE_FILE,
     client=None,
     s3_bucket: str | None = None,
+    sweep_config_path: str = "",
 ) -> list[PodRecord]:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
-    rows = status(state_path, client=client)
+    require_fetchable_git_ref(git_ref)
+
+    # State rows written before this guard existed carry an empty
+    # sweep_config_path; an explicit argument overrides whatever the row says,
+    # and the row is only trusted once it validates.
+    require_sweep_config_path(sweep_config_path or "")
+
+    sweep = Path(generated_dir).name
+    # Scoped to this sweep: an unfiltered state file mixes in unrelated runs
+    # (other sweeps, one-off verification pods) whose QUEUED/MISSING records
+    # would otherwise compete for this sweep's relaunch slots and skew its
+    # running-pod count -- found live, when a stale verification-pod record
+    # (a different GPU type with no stock) won a relaunch slot ahead of an
+    # actual sweep job sitting right behind it in the queue.
+    rows = [r for r in status(state_path, client=client) if r.get("sweep") == sweep]
     running = sum(1 for r in rows if r["state"] == "RUNNING")
     slots = max(0, max_concurrent - running)
     to_relaunch = [r for r in rows if r["state"] in ("QUEUED", "MISSING") and r["run_id"]]
@@ -486,44 +706,156 @@ def relaunch(
             max_seconds=r.get("max_seconds", max_seconds),
             config_path=r["config_path"],
             name=r.get("name", f"bdhx-{r['sweep']}-{r['exp']}"),
+            sweep_config_path=sweep_config_path,
         )
         docker_args = build_docker_args(rec, git_ref, s3_bucket=s3_bucket)
-        pod = client.create_pod(
-            name=rec.name,
-            image_name=image,
-            gpu_type_id=rec.gpu_type,
-            cloud_type=rec.cloud_type,
-            gpu_count=1,
-            container_disk_in_gb=20,
-            docker_args=_gql_escape(docker_args),
-            ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
-            env={
-                "RUN_ID": rec.run_id,
-                "MAX_SECONDS": str(rec.max_seconds),
-                **s3_env(s3_bucket),
-            },
-        )
+        try:
+            pod = client.create_pod(
+                name=rec.name,
+                image_name=image,
+                gpu_type_id=rec.gpu_type,
+                cloud_type=rec.cloud_type,
+                gpu_count=1,
+                container_disk_in_gb=20,
+                docker_args=_gql_escape(docker_args),
+                ports=f"{DEFAULT_HTTP_PORT}/http,22/tcp",
+                env={
+                    "RUN_ID": rec.run_id,
+                    "MAX_SECONDS": str(rec.max_seconds),
+                    **s3_env(s3_bucket),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - one job's failure must not sink the batch
+            # Left as-is (QUEUED/MISSING in the state history already); the
+            # next relaunch() call retries it.
+            print(f"WARNING: relaunch of {rec.run_id} failed, will retry next call: {e}")
+            continue
         rec.pod_id = pod["id"] if isinstance(pod, dict) else pod
         append_state(rec, state_path)
         relaunched.append(rec)
     return relaunched
 
 
+def elapsed_seconds(row: dict, now: float | None = None) -> float | None:
+    """How long a pod has been up: the API's uptime, else time since creation.
+
+    `uptimeSeconds` is not always populated -- Secure Cloud returned
+    `runtime: {ports: [...]}` with no `uptimeSeconds` at all for every pod of
+    the A1c/A4 pilot, for their whole lives. watchdog() read that as "no
+    information" and skipped them, so six pods whose jobs had crashed in the
+    first seconds sat at $0.74/hr for 2.2 hours past a 90-minute cap, and
+    print_status() showed "$0.000 so far" the entire time. The launcher writes
+    `created_at` itself when it creates the pod, so it always has a wall-clock
+    lower bound to fall back on; it can only over-estimate elapsed time by the
+    boot delay, which is the safe direction for a timeout.
+    """
+    pod = row.get("pod") or {}
+    uptime = pod.get("uptimeSeconds")
+    if uptime is not None:
+        return float(uptime)
+    created = row.get("created_at")
+    if created is None:
+        return None
+    return max((time.time() if now is None else now) - float(created), 0.0)
+
+
+def job_exit_code(pod_id: str, run_id: str, fetch=None, timeout: int = 20) -> int | None:
+    """The job's exit code, read over the pod's HTTP proxy, or None if not written yet.
+
+    build_docker_args() writes EXIT_CODE the moment run_experiment.py returns,
+    then tars the run directory and sleeps. RunPod keeps the pod allocated after
+    its docker command exits, so from the API a pod whose job crashed in the
+    first ten seconds is indistinguishable from one that is still training --
+    which is how six pilot pods billed for 2.2 hours on jobs that had already
+    failed. This is the cheap signal that tells them apart.
+    """
+    fetch = fetch or _http_text
+    text = fetch(f"{pod_proxy_url(pod_id)}/{run_id}/EXIT_CODE", timeout)
+    if text is None:
+        return None
+    try:
+        return int(text.strip())
+    except ValueError:
+        return None
+
+
 def watchdog(state_path: Path = DEFAULT_STATE_FILE, client=None, grace: float = 1.5) -> list[str]:
+    """Terminate pods that have overrun their wall clock. Returns the pod ids.
+
+    Deliberately does NOT reap a pod whose job has merely exited: the pod holds
+    the only copy of the run directory until `collect` fetches it, so ending a
+    finished-but-uncollected pod would throw the results away. `collect
+    --terminate-on-collect` is what ends a finished job; this is the safety net
+    for one that never finishes.
+    """
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     terminated = []
     for r in status(state_path, client=client):
         pod = r.get("pod")
         if not pod or r["state"] != "RUNNING":
             continue
-        uptime = pod.get("uptimeSeconds")
+        elapsed = elapsed_seconds(r)
         limit = r.get("max_seconds")
-        if uptime is not None and limit and uptime > grace * limit:
+        if elapsed is not None and limit and elapsed > grace * limit:
             client.terminate_pod(r["pod_id"])
             terminated.append(r["pod_id"])
     return terminated
+
+
+def _has_booted(pod: dict | None) -> bool:
+    """Whether a pod's container has actually started (any exposed port bound).
+
+    Observed repeatedly on Community Cloud (3/3 attempts during this
+    project's own verification): a pod can sit at desiredStatus=RUNNING,
+    uptimeSeconds=0, runtime=None indefinitely -- the container never
+    starts, no image pull progress, nothing. watchdog() cannot catch this:
+    uptimeSeconds never exceeds anything because it never leaves 0. Secure
+    Cloud never showed this failure mode (ports appeared within ~90s every
+    time). This is the boot-side counterpart to watchdog()'s training-side
+    timeout.
+    """
+    if pod is None:
+        return False
+    return bool((pod.get("runtime") or {}).get("ports"))
+
+
+def reap_stuck_boots(
+    state_path: Path = DEFAULT_STATE_FILE, client=None, boot_grace_seconds: int = 600
+) -> list[str]:
+    """Terminate and requeue pods that never booted within `boot_grace_seconds`.
+
+    Requeuing means appending a fresh QUEUED (pod_id=None) record for the same
+    run_id, so the next relaunch() call retries it -- same run_id, so
+    --resume still applies if anything was ever checkpointed (nothing will
+    have been, for a pod that never booted). Returns the run_ids requeued.
+    """
+    if client is None:
+        client = _default_client()
+
+    now = time.time()
+    requeued = []
+    for run_id, rec in latest_state_by_run_id(state_path).items():
+        if rec.get("done") or not rec.get("pod_id"):
+            continue
+        age = now - rec.get("created_at", now)
+        if age < boot_grace_seconds:
+            continue
+        try:
+            pod = client.get_pod(rec["pod_id"])
+        except Exception:  # noqa: BLE001 - already gone counts as not booted
+            pod = None
+        if _has_booted(pod):
+            continue
+        try:
+            client.terminate_pod(rec["pod_id"])
+        except Exception:  # noqa: BLE001, S110 - best effort; it may already be gone
+            pass
+        requeue_rec = PodRecord(**{**rec, "pod_id": None, "created_at": time.time()})
+        append_state(requeue_rec, state_path)
+        requeued.append(run_id)
+    return requeued
 
 
 # -- reap ---------------------------------------------------------------
@@ -531,7 +863,7 @@ def watchdog(state_path: Path = DEFAULT_STATE_FILE, client=None, grace: float = 
 
 def reap(prefix: str, client=None) -> dict:
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     pods = client.get_pods()
     matched = [p for p in pods if str(p.get("name", "")).startswith(prefix)]
@@ -570,6 +902,47 @@ def _http_fetch(url: str, dest: Path, timeout: int = 120) -> bool:
     return result.returncode == 0
 
 
+def _http_text(url: str, timeout: int = 20) -> str | None:
+    """GET a small file as text; None on any failure (missing file, dead pod)."""
+    try:
+        result = subprocess.run(
+            ["curl", "-fsS", "--max-time", str(timeout), url],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        # OSError covers a missing curl binary (FileNotFoundError) and a failed
+        # fork. Letting either escape emptied the whole `status` table -- the
+        # one place a runaway pod is meant to be visible -- while pods billed.
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _flatten_double_nested_run_dir(run_dir: Path) -> None:
+    """Undo the double-nesting build_docker_args()'s --out produces.
+
+    The pod's --out is /workspace/runs/<run_id>, but run_experiment.py's own
+    main() does `run_dir = Path(args.out) / run_id`, so results actually land
+    in .../<run_id>/<run_id>/ -- one extra level `tar czf` then preserves.
+    aggregate_results.py's walk_runs() looks for `<run_id>/results.json`
+    exactly one level under results_root, so left alone this silently drops
+    every job from the report. Found live, on the first 3 jobs the real A1
+    sweep collected. Fixing build_docker_args() would only help jobs
+    launched after the fix while leaving already-launched jobs inconsistent
+    with it (some already had this exact --out baked into their running
+    pod's docker_args) -- flattening here instead handles every job in the
+    sweep uniformly, launched under the old command or a fixed one alike.
+    """
+    nested = run_dir / run_dir.name
+    if not nested.is_dir():
+        return
+    for item in nested.iterdir():
+        shutil.move(str(item), str(run_dir / item.name))
+    nested.rmdir()
+
+
 def collect(
     generated_dir: Path,
     out_dir: Path,
@@ -585,7 +958,7 @@ def collect(
     network call the same way `client` fakes the RunPod SDK.
     """
     if client is None:
-        import runpod as client
+        client = _default_client()
 
     sweep = Path(generated_dir).name
     out_dir = Path(out_dir)
@@ -609,12 +982,37 @@ def collect(
         try:
             with tarfile.open(tar_path) as tf:
                 tf.extractall(out_dir, filter="data")
-        except tarfile.TarError as e:
-            skipped.append({"run_id": run_id, "reason": f"bad tarball: {e}"})
+        except Exception as e:  # noqa: BLE001 - one run's bad tarball must not sink the batch
+            # Deliberately broad, and NOT just tarfile.TarError: a truncated
+            # download surfaces as zlib.error and a full disk as OSError,
+            # neither of which is a TarError. Letting either propagate aborts
+            # the whole loop, so every run after it goes uncollected -- and an
+            # uncollected pod keeps billing, which is exactly what happened on
+            # this project's first real collect (a 100%-full disk mid-extract
+            # left three pods alive and idle). Skipping records the failure and
+            # leaves the pod up so a later `collect` can retry it.
+            skipped.append({"run_id": run_id, "reason": f"bad tarball: {type(e).__name__}: {e}"})
             continue
         finally:
             tar_path.unlink(missing_ok=True)
+        _flatten_double_nested_run_dir(out_dir / run_id)
         pulled.append(run_id)
+        append_state(
+            PodRecord(
+                sweep=rec.get("sweep", sweep),
+                exp=rec.get("exp", ""),
+                run_id=run_id,
+                pod_id=rec.get("pod_id"),
+                gpu_type=rec.get("gpu_type", ""),
+                cloud_type=rec.get("cloud_type", ""),
+                max_seconds=rec.get("max_seconds", 0),
+                config_path=rec.get("config_path", ""),
+                name=rec.get("name", ""),
+                sweep_config_path=rec.get("sweep_config_path", ""),
+                done=True,
+            ),
+            state_path,
+        )
         if terminate_on_collect:
             try:
                 client.terminate_pod(rec["pod_id"])
@@ -650,6 +1048,16 @@ def main(argv: list[str] | None = None) -> int:
     p_launch.add_argument("--image", default=DEFAULT_IMAGE)
     p_launch.add_argument("--dry-run", action="store_true")
     p_launch.add_argument(
+        "--sweep-config-path",
+        required=True,
+        help="source YAML generated_dir was expanded from (e.g. "
+        "configs/stage_a/a1_first_experiment.yaml); the pod regenerates "
+        "exp_NNN.yaml from it, since generated/ is gitignored. Required: "
+        "omitting it fails every job with FileNotFoundError on cfg.config_path "
+        "seconds after boot, and because a crashed job still tars its output "
+        "and sleeps, the pods keep billing until something reaps them",
+    )
+    p_launch.add_argument(
         "--s3-bucket",
         default=None,
         help="opt in to off-pod checkpoint sync (RUNPOD.md section 3); "
@@ -663,8 +1071,19 @@ def main(argv: list[str] | None = None) -> int:
     p_relaunch.add_argument("--git-ref", required=True)
     p_relaunch.add_argument("--max-concurrent", type=int, default=6)
     p_relaunch.add_argument("--s3-bucket", default=None)
+    p_relaunch.add_argument(
+        "--sweep-config-path",
+        required=True,
+        help="same source YAML `launch` was given; required for the same "
+        "reason, and NOT read back from the state file, which still holds "
+        "pre-guard rows with the field empty",
+    )
+    p_relaunch.add_argument("--max-wall-clock-minutes", type=int, default=180)
 
     sub.add_parser("watchdog")
+
+    p_boots = sub.add_parser("reap-stuck-boots")
+    p_boots.add_argument("--boot-grace-seconds", type=int, default=600)
 
     p_reap = sub.add_parser("reap")
     p_reap.add_argument("--prefix", required=True)
@@ -701,22 +1120,31 @@ def _dispatch(args: argparse.Namespace) -> int:
             image=args.image,
             dry_run=args.dry_run,
             s3_bucket=args.s3_bucket,
+            sweep_config_path=args.sweep_config_path,
         )
         launched = sum(1 for r in created if r.pod_id)
         print(f"{launched} pods created, {len(created) - launched} queued")
     elif args.cmd == "status":
-        print_status(status())
+        # The human-facing command pays for one small HTTPS GET per running
+        # pod so a finished-but-uncollected job is visible rather than
+        # indistinguishable from one still training.
+        print_status(status(check_exit_codes=True))
     elif args.cmd == "relaunch":
         r = relaunch(
             args.generated_dir,
             args.git_ref,
             max_concurrent=args.max_concurrent,
+            max_wall_clock_minutes=args.max_wall_clock_minutes,
             s3_bucket=args.s3_bucket,
+            sweep_config_path=args.sweep_config_path,
         )
         print(f"relaunched {len(r)} jobs")
     elif args.cmd == "watchdog":
         t = watchdog()
         print(f"terminated {len(t)} pods over 1.5x their wall-clock limit")
+    elif args.cmd == "reap-stuck-boots":
+        r = reap_stuck_boots(boot_grace_seconds=args.boot_grace_seconds)
+        print(f"requeued {len(r)} pods that never booted: {r}")
     elif args.cmd == "reap":
         r = reap(args.prefix)
         print(f"matched {r['matched']} pods, terminated {len(r['terminated'])}")

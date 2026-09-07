@@ -146,6 +146,48 @@ def test_summary_stats_and_bootstrap_ci(two_group_results, tmp_path):
     assert lo <= mean <= hi
 
 
+def test_walk_runs_dedupes_pre_existing_duplicate_evaluation_rows(tmp_path):
+    """Regression test: found live on the real A1 sweep. Several run_ids'
+    results.json (written before ResultsWriter.flush() deduped on write)
+    already have 2-3 rows for the same (step, reasoning_steps, split,
+    difficulty) cell, from being relaunched after they had already reached
+    their final step. build_summary() groups across runs by that exact key
+    without deduping within a run first, so every duplicate silently counted
+    as an extra seed -- a 3-seed sweep cell read back with n_seeds in the
+    30s. walk_runs() must dedupe on load so aggregation stays correct
+    regardless of how the file on disk got that way.
+    """
+    root = tmp_path / "results"
+    root.mkdir()
+    run_dir = _write_run(
+        root,
+        "run_s1",
+        config_hash="hashE",
+        seed=1,
+        model="modelE",
+        task="toytask4",
+        params=100_000,
+        exact_match=0.5,
+    )
+    data = json.loads((run_dir / "results.json").read_text())
+    duplicate = dict(data["evaluations"][0])
+    duplicate["exact_match"] = 0.9  # a distinct value so we can tell which one survives
+    data["evaluations"].append(duplicate)
+    (run_dir / "results.json").write_text(json.dumps(data))
+
+    records = walk_runs(root)
+    assert len(records) == 1
+    assert len(records[0].results.evaluations) == 1
+    assert records[0].results.evaluations[0].exact_match == 0.9  # the later duplicate wins
+
+    out_dir = tmp_path / "report"
+    result = aggregate(root, out_dir)
+    with open(result["summary"]) as f:
+        rows = list(csv.DictReader(f))
+    row = next(r for r in rows if r["config_hash"] == "hashE")
+    assert row["n_seeds"] == "1"  # not 2, despite the duplicate row on disk
+
+
 def test_diverged_run_flagged_and_counted_as_zero(tmp_path):
     root = tmp_path / "results"
     root.mkdir()
@@ -268,3 +310,312 @@ def test_at_chance_flag_fires_for_a_flat_run(tmp_path):
     at_chance_rows = [r for r in rows if r["flag"] == "AT_CHANCE"]
     assert [r["config_hash"] for r in at_chance_rows] == ["hashFlat"]
     assert "ln(vocab)" in at_chance_rows[0]["detail"]
+
+
+# -- the A4 sweep: arms that differ only in recurrence.kind -------------------
+
+
+def _write_arm(root, run_id, *, config_hash, seed, kind, step, cos_last, task="propagate"):
+    """One a4_convergence-shaped run: model is always bdh_cq, kind is the arm."""
+    run_dir = root / run_id
+    writer = ResultsWriter(
+        run_dir,
+        run_id=run_id,
+        config_hash=config_hash,
+        seed=seed,
+        model="bdh_cq",
+        task=task,
+        params=10_000_000,
+        status="ok",
+    )
+    writer.add_evaluation(
+        {
+            "step": step,
+            "reasoning_steps": 32,
+            "split": "mild",
+            "difficulty": {"distance": 6},
+            "n_episodes": 200,
+            "exact_match": 0.0,
+            "token_acc": 0.5,
+            "diagnostics": {"cos_consecutive": [0.5, 0.8, cos_last], "nan_count": 0},
+        }
+    )
+    writer.flush()
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "config": {
+                    "experiment": {"name": "a4", "stage": "A", "tags": []},
+                    "model": {"recurrence": {"kind": kind}},
+                    "reasoning": {"train_steps": [1, 2, 4]},
+                },
+                "train_flops_estimate": 1.0e9,
+            }
+        )
+    )
+    return run_dir
+
+
+def test_convergence_rows_keep_recurrence_kinds_apart(tmp_path):
+    """Regression: every a4_convergence arm reports model 'bdh_cq'.
+
+    They differ only in `model.recurrence.kind`, which lives in metadata and not
+    in ResultsFile at all, so a cell key of (model, split, difficulty, R)
+    averaged all three update rules into one row labelled n_seeds=3 -- and that
+    CSV is the pilot's stated primary readout. The three arms must stay
+    separate, with their own cos_last.
+    """
+    from bdhx.results.aggregate import convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    for i, (kind, cos) in enumerate(
+        [("plain", 0.74), ("attn_residual", 0.99), ("init_skip", 0.88)]
+    ):
+        _write_arm(
+            root, f"h{i}_s1", config_hash=f"h{i}", seed=1, kind=kind, step=8000, cos_last=cos
+        )
+
+    rows = convergence_rows(walk_runs(root), "propagate")
+    by_kind = {r["recurrence_kind"]: r for r in rows}
+    assert set(by_kind) == {"plain", "attn_residual", "init_skip"}
+    assert all(r["n_seeds"] == 1 for r in rows)
+    assert by_kind["attn_residual"]["cos_last"] == pytest.approx(0.99)
+    assert by_kind["plain"]["cos_last"] == pytest.approx(0.74)
+    assert {r["arm"] for r in rows} == {
+        "bdh_cq/plain",
+        "bdh_cq/attn_residual",
+        "bdh_cq/init_skip",
+    }
+
+
+def test_convergence_rows_keep_a_run_that_stopped_early(tmp_path):
+    """Regression: `final_step` was the max over ALL runs, so a short run vanished.
+
+    The pilots cap wall clock at 90 minutes against an 80.1-minute estimate and
+    `Trainer` stops on that deadline, so an overrunning job's final evaluation
+    lands below the nominal step count. Under a global max it produced no row at
+    all -- not a smaller n_seeds, no warning.
+    """
+    from bdhx.results.aggregate import convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_arm(root, "h0_s1", config_hash="h0", seed=1, kind="plain", step=8000, cos_last=0.74)
+    _write_arm(root, "h1_s1", config_hash="h1", seed=1, kind="init_skip", step=7400, cos_last=0.95)
+
+    kinds = {r["recurrence_kind"] for r in convergence_rows(walk_runs(root), "propagate")}
+    assert kinds == {"plain", "init_skip"}
+
+
+def test_diagnostic_series_are_written_per_arm(tmp_path):
+    """The per-iteration CSVs were also keyed on the model name alone."""
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_arm(root, "h0_s1", config_hash="h0", seed=1, kind="plain", step=8000, cos_last=0.74)
+    _write_arm(root, "h1_s1", config_hash="h1", seed=1, kind="init_skip", step=8000, cos_last=0.95)
+
+    out = tmp_path / "report"
+    aggregate(root, out)
+    assert (out / "cos_consecutive_vs_iteration_bdh_cq_plain_propagate.csv").exists()
+    assert (out / "cos_consecutive_vs_iteration_bdh_cq_init_skip_propagate.csv").exists()
+    with open(out / "cos_consecutive_vs_iteration_bdh_cq_plain_propagate.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows and {"config_hash", "recurrence_kind", "split", "reasoning_steps"} <= set(rows[0])
+
+
+def test_single_iteration_rows_are_flagged_not_comparable(tmp_path):
+    """`cos_last` at R=1 is cos(H[1], seed), not cos(H[R], H[R-1]).
+
+    The diagnostics compare iteration 0 against the ingested seed rather than a
+    previous latent, so a one-iteration run's only value measures a different
+    thing from the R=32 rows beside it in the same CSV. Flagged rather than
+    dropped: the row stays visible and explicitly uncomparable.
+    """
+    from bdhx.results.aggregate import convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    run_dir = root / "h0_s1"
+    writer = ResultsWriter(
+        run_dir,
+        run_id="h0_s1",
+        config_hash="h0",
+        seed=1,
+        model="bdh_cq",
+        task="propagate",
+        params=10,
+        status="ok",
+    )
+    for r, cos in ((1, [0.21]), (32, [0.21, 0.8, 0.74])):
+        writer.add_evaluation(
+            {
+                "step": 100,
+                "reasoning_steps": r,
+                "split": "mild",
+                "difficulty": {"distance": 6},
+                "n_episodes": 10,
+                "exact_match": 0.0,
+                "token_acc": 0.5,
+                "diagnostics": {"cos_consecutive": cos, "nan_count": 0},
+            }
+        )
+    writer.flush()
+    (run_dir / "metadata.json").write_text(
+        json.dumps({"config": {"experiment": {"tags": []}, "model": {"recurrence": {}}}})
+    )
+
+    by_r = {r["reasoning_steps"]: r for r in convergence_rows(walk_runs(root), "propagate")}
+    assert by_r[1]["cos_last_vs_seed"] == 1.0
+    assert by_r[32]["cos_last_vs_seed"] == 0.0
+
+
+# -- convergence onset: when does the loop stop settling? ---------------------
+
+
+def _write_onset_arm(root, run_id, *, config_hash, seed, kind, curve, task="propagate"):
+    """One run whose checkpoints carry a cos_last trajectory: {step: cos_last}."""
+    run_dir = root / run_id
+    writer = ResultsWriter(
+        run_dir,
+        run_id=run_id,
+        config_hash=config_hash,
+        seed=seed,
+        model="bdh_cq",
+        task=task,
+        params=10_000_000,
+        status="ok",
+    )
+    for step, cos_last in sorted(curve.items()):
+        writer.add_evaluation(
+            {
+                "step": step,
+                "reasoning_steps": 16,
+                "split": "interp",
+                "difficulty": {"distance": 1},
+                "n_episodes": 200,
+                "exact_match": 0.0,
+                "token_acc": 0.5,
+                "diagnostics": {"cos_consecutive": [0.5, 0.8, cos_last], "nan_count": 0},
+            }
+        )
+    writer.flush()
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "config": {
+                    "experiment": {"name": "a1", "stage": "A", "tags": []},
+                    "model": {"recurrence": {"kind": kind}},
+                    "reasoning": {"train_steps": [1, 2, 4]},
+                },
+                "train_flops_estimate": 1.0e9,
+            }
+        )
+    )
+    return run_dir
+
+
+def test_convergence_onset_keeps_every_checkpoint(tmp_path):
+    """`convergence_rows` keeps only the final step, so onset is unrecoverable.
+
+    The whole A1b effect lives in a window (cos_last at R=16 holds above 0.98
+    to step 12500, falls to 0.81 by 20000, then is flat) that a final-step row
+    averages away into a single number.
+    """
+    from bdhx.results.aggregate import convergence_onset_rows, convergence_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    curve = {2500: 0.999, 12500: 0.985, 20000: 0.810, 40000: 0.780}
+    _write_onset_arm(root, "h0_s1", config_hash="h0", seed=1, kind="plain", curve=curve)
+    records = walk_runs(root)
+
+    # The final-step table has no `step` column at all: one row, one number.
+    final = convergence_rows(records, "propagate")
+    assert len(final) == 1 and "step" not in final[0]
+    assert final[0]["cos_last"] == pytest.approx(0.780)
+    onset = convergence_onset_rows(records, "propagate")
+    assert [r["step"] for r in onset] == [2500, 12500, 20000, 40000]
+    assert [pytest.approx(r["cos_last"]) for r in onset] == [0.999, 0.985, 0.810, 0.780]
+
+
+def test_convergence_onset_averages_seeds_but_not_arms(tmp_path):
+    """Two seeds of one arm share a row; a different kind gets its own."""
+    from bdhx.results.aggregate import convergence_onset_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_onset_arm(root, "h0_s1", config_hash="h0", seed=1, kind="plain", curve={2500: 0.8})
+    _write_onset_arm(root, "h0_s2", config_hash="h0", seed=2, kind="plain", curve={2500: 0.6})
+    _write_onset_arm(root, "h1_s1", config_hash="h1", seed=1, kind="init_skip", curve={2500: 1.0})
+
+    rows = {r["arm"]: r for r in convergence_onset_rows(walk_runs(root), "propagate")}
+    assert set(rows) == {"bdh_cq/plain", "bdh_cq/init_skip"}
+    assert rows["bdh_cq/plain"]["n_seeds"] == 2
+    assert rows["bdh_cq/plain"]["cos_last"] == pytest.approx(0.7)
+    assert rows["bdh_cq/init_skip"]["n_seeds"] == 1
+
+
+def test_convergence_onset_does_not_join_runs_of_different_length(tmp_path):
+    """Regression: an 8000-step pilot and a 40000-step arm are both bdh_cq/plain.
+
+    Keyed on `arm` alone their checkpoints merge into one line describing a
+    trajectory neither run took. `config_hash` must stay in the key.
+    """
+    from bdhx.results.aggregate import convergence_onset_rows
+
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_onset_arm(
+        root, "pilot_s1", config_hash="pilot", seed=1, kind="plain", curve={2500: 1.0, 5000: 1.0}
+    )
+    _write_onset_arm(
+        root, "full_s1", config_hash="full", seed=1, kind="plain", curve={2500: 1.0, 20000: 0.8}
+    )
+
+    rows = convergence_onset_rows(walk_runs(root), "propagate")
+    assert {r["config_hash"] for r in rows} == {"pilot", "full"}
+    by_hash = {}
+    for r in rows:
+        by_hash.setdefault(r["config_hash"], []).append(r["step"])
+    assert sorted(by_hash["pilot"]) == [2500, 5000]
+    assert sorted(by_hash["full"]) == [2500, 20000]
+
+
+def test_convergence_onset_csv_is_written(tmp_path):
+    from bdhx.results.aggregate import ONSET_COLUMNS
+
+    root = tmp_path / "results"
+    root.mkdir()
+    _write_onset_arm(
+        root, "h0_s1", config_hash="h0", seed=1, kind="plain", curve={2500: 1.0, 20000: 0.8}
+    )
+    out = tmp_path / "report"
+    aggregate(root, out)
+    path = out / "convergence_onset_propagate.csv"
+    assert path.exists()
+    with path.open() as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["step"] for r in rows] == ["2500", "20000"]
+    assert set(ONSET_COLUMNS) <= set(rows[0])
+
+
+def test_difficulty_shortener_keeps_only_the_varying_fields(tmp_path):
+    """A propagate legend entry names four fields where one varies."""
+    from bdhx.results.aggregate import _difficulty_shortener
+
+    keys = [
+        '{"dim": 1, "distance": 1, "length": 12, "n_sources": 1}',
+        '{"dim": 1, "distance": 4, "length": 12, "n_sources": 1}',
+    ]
+    render = _difficulty_shortener(keys)
+    assert render(keys[0]) == "distance=1"
+    assert render(keys[1]) == "distance=4"
+
+
+def test_difficulty_shortener_falls_back_when_nothing_varies(tmp_path):
+    """One difficulty group must still be named, not rendered as an empty string."""
+    from bdhx.results.aggregate import _difficulty_shortener
+
+    keys = ['{"distance": 1, "length": 12}']
+    assert _difficulty_shortener(keys)(keys[0]) == "distance=1 length=12"
