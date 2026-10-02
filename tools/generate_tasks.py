@@ -22,11 +22,10 @@ import numpy as np
 
 import bdhx.tasks  # noqa: F401  (registers task modules)
 from bdhx.config import PROJECT_ROOT
+from bdhx.metadata import GENERATOR_VERSION  # single source of truth
 from bdhx.registry import get_task
 from bdhx.seeding import episode_id, task_rng
 from bdhx.tasks.base import Episode, EpisodicTask
-
-GENERATOR_VERSION = "0.1.0"
 
 
 def _git_commit() -> str:

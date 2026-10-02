@@ -19,14 +19,33 @@ A1 = PROJECT_ROOT / "configs" / "stage_a" / "a1_first_experiment.yaml"
 C1 = PROJECT_ROOT / "configs" / "stage_c" / "c1_recurrence_engineering.yaml"
 
 
-def test_a1_expands_to_18_configs():
+def test_a1_expands_to_30_configs_and_its_hashes_survived_the_seed_raise():
+    """A1 went to 5 seeds on 2026-09-07 to put the propagate Gate A finding on
+    this project's own 5-seed footing.
+
+    The count assertion is the boring half. The half that matters is that the
+    ARM hashes did not move: `seeds` must stay out of the config hash
+    (training.seed is in HASH_EXCLUDED_FIELDS) so that seeds 4 and 5 land in
+    the same cells as 1-3 and the aggregator pools all five. If a hash ever
+    changed here, the new seeds would silently form separate cells and every
+    n_seeds in the tables would be wrong while looking entirely healthy.
+    """
     jobs, meta = expand_sweep(A1)
-    assert len(jobs) == 18  # 3 models x 2 tasks x 3 seeds
+    assert len(jobs) == 30  # 3 models x 2 tasks x 5 seeds
     assert meta["name"] == "a1_first_experiment"
     # The hash is seed-invariant (config.HASH_EXCLUDED_FIELDS): one hash per
     # sweep arm, and (hash, seed) identifies a job.
     assert len({j.hash for j in jobs}) == 6  # 3 models x 2 tasks
-    assert len({(j.hash, j.seed) for j in jobs}) == 18
+    assert len({(j.hash, j.seed) for j in jobs}) == 30
+
+    # The three propagate arms that carry the finding, pinned by value: these
+    # are the cells seeds 4 and 5 were launched into on RunPod.
+    propagate = {j.hash for j in jobs if j.cfg.task.name == "propagate"}
+    assert propagate == {"5474de1f354e", "f0b8b7c55f92", "2d1c70257fcb"}
+
+    # Every arm carries all five seeds, which is what "5-seed" has to mean.
+    for h in propagate:
+        assert {j.seed for j in jobs if j.hash == h} == {1, 2, 3, 4, 5}
 
 
 def test_seed_policy_refuses_below_3_without_dev(tmp_path):

@@ -108,8 +108,38 @@ class ResultsWriter:
         return row
 
     def flush(self) -> Path:
+        self._dedupe_evaluations()
         self.path.write_text(json.dumps(self.results.model_dump(mode="json"), indent=2))
         return self.path
+
+    def _dedupe_evaluations(self) -> None:
+        """Keep only the last evaluation row per (step, reasoning_steps,
+        split, difficulty).
+
+        run_experiment.py extends a resumed run's evaluations with those
+        loaded from the previous results.json, then unconditionally runs and
+        appends a final evaluation -- which duplicates the previous entry
+        whenever the run had already reached its final step before this
+        attempt started (nothing left to train, e.g. a pod relaunched after
+        it had already finished). Found live: a job relaunched this way ends
+        up with 2-3x the intended evaluation rows for the same cell, which
+        aggregate.py's build_summary() would otherwise count as extra seeds.
+        """
+        seen: dict[tuple, int] = {}
+        deduped: list[EvaluationRow] = []
+        for row in self.results.evaluations:
+            key = (
+                row.step,
+                row.reasoning_steps,
+                row.split,
+                tuple(sorted(row.difficulty.items())),
+            )
+            if key in seen:
+                deduped[seen[key]] = row
+            else:
+                seen[key] = len(deduped)
+                deduped.append(row)
+        self.results.evaluations = deduped
 
     @staticmethod
     def load(run_dir: str | Path) -> ResultsFile:

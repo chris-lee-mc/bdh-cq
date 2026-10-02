@@ -1,4 +1,26 @@
 # Stage C: each recurrence modification individually vs the same baseline.
+#
+# DO NOT RUN AS WRITTEN. Superseded in premise by experiment A4
+# (docs/RESULTS.md section A4), which ran three of this grid's seven kinds --
+# residual, init_skip, attn_residual -- on propagate for 40000 steps x 3 seeds.
+#
+# The result: `residual` takes cos(H[R], H[R-1]) at R=32 from plain BDH-CQ's
+# 0.802 to 1.0000, a perfect fixed point matching the looped Transformer, and
+# exact match past R_train_max=4 stays at exactly 0.000 -- every arm, every
+# seed, every difficulty. attn_residual reaches 0.999 and is *worse* than
+# plain on token accuracy at R=32 (0.586 vs 0.664).
+#
+# So the convergence target this sweep is built around has been measured and
+# saturated by its own cheapest arm, and it does not predict the accuracy this
+# project cares about. Four of the remaining kinds (step_gate, step_emb,
+# adapter, and plain itself) are further variations on conditioning the same
+# map; there is no reason left to expect them to separate on accuracy when a
+# map at cos_last = 1.0000 does not.
+#
+# Rewrite this sweep around a hypothesis A4 has not already answered before
+# spending ~$40 on it. The open question A4 leaves is what looped_transformer
+# does that bdh_cq does not, given that the two are tied at cos_last 1.000 and
+# 0.973 apart on exact match at R=8.
 sweep:
   name: c1_recurrence_engineering
   stage: C

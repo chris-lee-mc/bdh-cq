@@ -133,3 +133,68 @@ def test_jacobian_only_at_the_documented_depths(tmp_path):
     estimate = by_depth[8].diagnostics.jacobian_eigenvalue_estimate
     assert len(estimate) == 1 and estimate[0] >= 0.0
     assert len(by_depth[8].diagnostics.state_norm) == 8
+
+
+def test_reduced_reasoning_steps_honours_the_configured_override():
+    """A1 could not answer WHEN the loop stops settling at R=32.
+
+    `INTERMEDIATE_REASONING_STEPS` is (1, 4, 16), so no mid-training checkpoint
+    ever measured R=32 and the deepest cell had exactly one data point.
+    """
+    from bdhx.config import Config
+    from bdhx.training.evaluate import reduced_reasoning_steps
+
+    base = {
+        "experiment": {"name": "x", "stage": "A"},
+        "model": {"name": "bdh_cq"},
+        "task": {"name": "propagate"},
+        "training": {"steps": 100, "batch_size": 4},
+    }
+
+    def cfg(evaluation):
+        return Config.model_validate({**base, "evaluation": evaluation})
+
+    default = cfg({"reasoning_steps": [1, 2, 4, 8, 16, 32]})
+    assert reduced_reasoning_steps(default) == [1, 4, 16]
+
+    override = cfg(
+        {"reasoning_steps": [1, 2, 4, 8, 16, 32], "intermediate_reasoning_steps": [1, 4, 32]}
+    )
+    assert reduced_reasoning_steps(override) == [1, 4, 32]
+
+
+def test_reduced_reasoning_steps_intersects_with_the_evaluated_depths():
+    """A mid-training row at an R the final evaluation never visits is uncomparable."""
+    from bdhx.config import Config
+    from bdhx.training.evaluate import reduced_reasoning_steps
+
+    cfg = Config.model_validate(
+        {
+            "experiment": {"name": "x", "stage": "A"},
+            "model": {"name": "bdh_cq"},
+            "task": {"name": "propagate"},
+            "training": {"steps": 100, "batch_size": 4},
+            "evaluation": {
+                "reasoning_steps": [1, 4],
+                "intermediate_reasoning_steps": [4, 64],
+            },
+        }
+    )
+    assert reduced_reasoning_steps(cfg) == [4]
+
+
+def test_reduced_reasoning_steps_never_returns_empty():
+    """An empty intersection falls back to the shallowest depth, not to skipping."""
+    from bdhx.config import Config
+    from bdhx.training.evaluate import reduced_reasoning_steps
+
+    cfg = Config.model_validate(
+        {
+            "experiment": {"name": "x", "stage": "A"},
+            "model": {"name": "bdh_cq"},
+            "task": {"name": "propagate"},
+            "training": {"steps": 100, "batch_size": 4},
+            "evaluation": {"reasoning_steps": [2], "intermediate_reasoning_steps": [64]},
+        }
+    )
+    assert reduced_reasoning_steps(cfg) == [2]

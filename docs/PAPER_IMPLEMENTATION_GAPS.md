@@ -15,13 +15,27 @@ throughout:
 - GUESS: an implementation choice the community author made without a
   public specification, or that we inferred.
 
-Sourcing caveat: arXiv full texts were not fetchable from the research
-environment. Paper statements below come from the abstracts, Pathway's
-public explainer pages, and secondary technical summaries. Every row
-marked "verify" must be checked against the PDF before it is cited in a
-report. Two facts were verified from primary sources directly: the
-Pathway reference code and the community code including its commit
-history.
+Sourcing caveat: at v0.1 the arXiv full texts were not fetchable from the
+research environment, so paper statements below come from the abstracts,
+Pathway's public explainer pages, and secondary technical summaries. Every
+row still marked "verify" must be checked against the PDF before it is
+cited in a report. Verified from primary sources directly: the Pathway
+reference code, the community code including its commit history, and (added
+2026-09-07, when the full text did fetch) the single row this project's
+conclusions rest on -- the latent transition function, section 1 row 14.
+
+That row is now confirmed against the paper itself rather than a summary.
+BDH-CQ (arXiv 2608.09888) gives only the signature of the update,
+
+    H_{r+1} = F_theta(H_r, S_K),   r = 0, ..., R-1        (eq. 3)
+
+and states that "dimensions, exact update rules, and implementation details
+remain proprietary". The paper also does not test or claim R_test greater
+than R_train_max: it reports scaling inference effort (LOW/MEDIUM/HIGH, 21
+to 29.5 percent pass@2 on ARC-AGI-1) without saying whether those levels
+were trained. So Stage A's Gate D failure contradicts no published claim,
+and the GUESS label on row 14 is correct rather than merely cautious. The
+remaining "verify" rows are unchanged and still unchecked.
 
 Confidence scale: High = verified in code and consistent with paper
 text; Medium = code verified, paper statement from secondary summary;
@@ -45,8 +59,8 @@ Low = inferred, or the code admits uncertainty.
 | Latent transition function (what happens per reasoning step) | PAPER (BDH-CQ): NOT public | CODE: feed the last hidden state back as the next "token" through the same block, `bdh_cq.py:512-535`; the author writes "sans knowing their secretive latent transition function", `bdh_cq.py:412` | Low (GUESS) | Yes: this is the central object of Stage A and Stage C; every recurrence variant in `models/recurrence.py` is a hypothesis about this function |
 | Attention residual across reasoning steps with depth bias | PAPER (BDH-CQ): NOT public. The code cites Kimi "Attention Residuals" (2603.15031) and a reverse-RoPE depth-recurrence paper found later (commits `c7049fb`, `77b36b2`) | CODE: `AttentionResidual` learned pseudo-query softmax over all prior block outputs, `bdh_cq.py:94-146, 390-405`; author reports identity residual "collapses" at 8 steps and attention residual is "much more stable", commit `8077188` | Low (GUESS) | Yes: Stage C compares plain, residual, attention-residual, step-gate, init-skip under matched params |
 | Latent step embedding | PAPER: not specified | CODE: optional learned `latent_step_embed` added at each latent step, `bdh_cq.py:461, 527-528`; off by default in `figure7.py` | Low (GUESS) | Yes: H6 step-embedding variant |
-| Latent-effort curriculum (uniform 0..8 reasoning steps per training step) | PAPER (BDH-CQ): section 7 reportedly describes an effort schedule (verify exact schedule) | CODE: `rng.randint(0, MAX_REASONING_STEPS=8)` per step, `figure7.py:87`; commit `e28abc8` mentions "ramp up curriculum of steps then uniform" | Medium | Yes: H5 fixed vs curriculum vs delayed |
-| Latent step training target | PAPER: not specified (verify) | CODE: each latent position predicts the first token of the next tensor segment, `bdh_cq.py:517-522, 545-550` | Low (GUESS) | Yes, design decision: the framework must state its loss explicitly; keep this as the `legacy` loss and add a final-answer-only loss |
+| Latent-effort curriculum (uniform 0..8 reasoning steps per training step) | PAPER (BDH-CQ): section 7 confirms the PRINCIPLE and nothing more -- "we train the model changing the levels of latent reasoning during training", giving a model "exposed to different reasoning efforts during training" -- with no range, maximum, or schedule stated (verified against full text 2026-09-07) | CODE: `rng.randint(0, MAX_REASONING_STEPS=8)` per step, `figure7.py:87`; commit `e28abc8` mentions "ramp up curriculum of steps then uniform" | Medium | Yes: H5 fixed vs curriculum vs delayed |
+| Latent step training target | PAPER: not specified. Section 4.2 says only that the objective trains the system to produce exact target grids, and that "the complete internal training recipe remains proprietary" (verified 2026-09-07) | CODE: each latent position predicts the first token of the next tensor segment, `bdh_cq.py:517-522, 545-550` | Low (GUESS) | Yes, design decision: the framework must state its loss explicitly; keep this as the `legacy` loss and add a final-answer-only loss |
 | Memory freezing during reasoning | PAPER (BDH-CQ): one summary says memory is frozen after context acquisition | CODE: `update_memory` and `update_latent_memory` flags, `bdh_cq.py:417-422, 463`; `figure7.py` writes prompt to memory by default | Medium | Yes, cheap: frozen vs writable memory during latent steps |
 | Higher-order BDH | PAPER (BDH-CQ): "higher-order BDH" named, definition not public | CODE: `HigherOrderBDHLayer` order-2 poly-attention with `(S3, z3)` sufficient statistics, `higher_order_bdh.py:37, 89-128`; cites Chakrabarti et al. ICLR 2026 | Low (GUESS) | Yes, later: order-1 vs order-2 on T5 compose depth 2 (the repo claims order-2 solves two-hop, order-1 does not) |
 | Halting or adaptive computation | PAPER: not stated either way | CODE: none; the caller passes an int | n/a | Not in scope initially; fixed R sweeps |
@@ -71,9 +85,22 @@ validity. Line numbers refer to the commit above.
    Stage A evaluates to 64; expect numerical surprises and instrument for
    them.
 4. Structural assertions ("latent reasoning cannot be the final stage")
-   fire only in the loss path (`bdh_cq.py:568, 572`); a bare forward that
-   ends on an int stage silently returns stale logits. The adapter must
-   never call the wrapper that way, and a test should cover it.
+   fire only in the loss path (`bdh_cq.py:568, 572`, both after the
+   `if not return_loss` early return at `:560-566`); a bare forward that
+   ends on an int stage silently returns stale logits -- those of the last
+   TENSOR stage, from before the reasoning ran, identical for every step
+   count. Confirmed by running it, at upstream HEAD `c246f890` (v0.0.20).
+   The adapter must never call the wrapper that way, and a test should
+   cover it.
+   Note what this is NOT: a trailing int stage is intended API surface, not
+   a misuse. Upstream's own `generate()` (`:629-636`) calls the wrapper that
+   way on purpose, discards the logits with `_, memories = ...`, and
+   re-derives the seed from `memories.embeds`. Moving the two asserts above
+   the early return therefore breaks 8 of the 46 upstream tests; returning
+   `None` for the logits instead passes all 46. The full report and the
+   verified patch are in `docs/upstream/lucidrains-bdh-cq-stale-logits.md`,
+   drafted but not filed -- this session could not attach the upstream repo
+   with write access.
 5. `update_memory_per_stage` must match the stage count exactly
    (`bdh_cq.py:483-484`).
 6. Memory reuse across a reasoning-step sweep is safe only because
@@ -106,6 +133,34 @@ validity. Line numbers refer to the commit above.
   Where a result contradicts a Pathway claim, the write-up says the
   contradiction is with the community reconstruction at small scale, not
   with the unreleased model.
+
+## 3a. Verification pass, 2026-09-07
+
+The BDH-CQ full text became fetchable and three rows were checked against it
+rather than against summaries. What it changes:
+
+- The latent transition function stays a GUESS, now on primary-source
+  authority: eq. 3 gives only `H_{r+1} = F_theta(H_r, S_K)` and the paper
+  says update rules "remain proprietary" (section 1 row 14, and the sourcing
+  caveat above).
+- Training DOES vary the reasoning effort. This project sampling R per
+  training step is the paper's principle, not an invention. But the paper
+  states no range, no maximum and no schedule, so no arm here can be called
+  "the paper's schedule" either.
+- The LOW/MEDIUM/HIGH inference levels (21, 27, 29.5 percent pass@2) are
+  operational labels with no published step counts, and the paper does not
+  say whether those levels were seen in training. There is therefore no
+  published R_test > R_train_max claim to agree or disagree with.
+
+Consequence for A5 specifically: extending the trained set from {1,2,4} to
+{1,2,4,8} is not a move toward or away from the paper's setup, because the
+paper's trained range is unpublished. A5 asks a question the paper leaves
+open rather than one it answers, and its result must be stated as a property
+of the community reconstruction.
+
+Rows still unverified: the exact Hebbian update form, whether values are the
+raw residual stream, and per-depth-slot memories. None of the three affects
+a conclusion drawn so far; check them before any Stage B write-up cites them.
 
 ## 4. Sources
 

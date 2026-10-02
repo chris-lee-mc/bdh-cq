@@ -16,8 +16,15 @@ import torch
 
 from bdhx.config import Config, config_hash
 
+# Bumped whenever a task's episode distribution changes (TASK_SUITE_SPEC
+# section 4). 0.2.0: `compose` guarantees every episode is solvable from its
+# own demonstrations and demonstrates each function on the images of the
+# previous one's inputs, so the query is required.
+GENERATOR_VERSION = "0.2.0"
+
 METADATA_FIELDS = (
     "git_commit",
+    "generator_version",
     "git_dirty",
     "config_hash",
     "config",
@@ -91,6 +98,13 @@ def collect_metadata(cfg: Config, run_dir: str | Path) -> dict[str, Any]:
             "git_commit": _git(["rev-parse", "HEAD"]),
             "git_dirty": None if status is None else bool(status),
             "config_hash": config_hash(cfg),
+            # The task generator's distribution version. Without it a run
+            # carries no record of WHICH compose it trained on, and the
+            # aggregator's rule that two generator versions must never share a
+            # plot has nothing to enforce itself with -- `acc_vs_reasoning_steps`
+            # groups by (model, split) and pools across config hashes, so A1's
+            # compose rows and A1c's would silently merge.
+            "generator_version": GENERATOR_VERSION,
             "config": cfg.model_dump(mode="json"),
             "seed": cfg.training.seed,
             "task_seed": cfg.task.seed,

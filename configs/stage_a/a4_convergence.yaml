@@ -1,0 +1,117 @@
+# Stage A, experiment A4: can BDH-CQ learn propagate and keep its fixed point?
+#
+# A narrowed slice of configs/stage_c/c1_recurrence_engineering.yaml, pulled
+# forward because RESULTS.md section A1b measured the thing C1 was going to
+# guess at.  The question has since sharpened twice, and the current form is
+# not the one this file was opened with.
+#
+# What is established (RESULTS.md, convergence onset), all of it from A1's
+# own checkpoints at no GPU cost:
+#
+#   - bdh_cq's loop DOES settle early in training.  `cos(H[R], H[R-1])` at
+#     R=16 on interp holds above 0.98 through step 12500, falls to 0.81 by
+#     20000, and is then flat for the remaining 20000 steps.  The loss of
+#     convergence is acquired, in a window, not present from initialization.
+#   - That window is exactly where the task is acquired: exact match at R=4
+#     goes 0.05 -> 0.23 -> 0.70 -> 0.89 over the same four checkpoints.
+#   - It is NOT the price of learning.  looped_transformer learns the same
+#     task on the same budget to exact match 1.000 and its cos_last at R=16
+#     is 0.9998 at every one of the 16 checkpoints -- it never moves.
+#   - `bdh` is not evidence either way: it has no latent loop at all
+#     (bdhx/models/bdh.py, "reasoning_steps > 1 is ignored"), which is why its
+#     accuracy and cos_last are flat in R.  It is a no-loop control.
+#
+# So the question is not "does anything make the loop converge" -- an
+# untrained loop already converges, and so does one on a split the model
+# never learns.  It is whether any update rule reaches the looped
+# Transformer's regime: LEARNS the task AND keeps the fixed point.
+#
+# The primary metric is therefore JOINT and an arm must win on both halves:
+#   1. `cos_last` at R=32 from recurrence_convergence_propagate.csv, and
+#   2. exact match at R=4 (did it learn at all) at the same checkpoint.
+# An arm at cos_last 1.0 and exact match 0.0 has not fixed anything; it has
+# failed to learn, which is the trivially convergent case.  The 8000-step
+# pilot produced exactly that on all three arms and is why this sweep cannot
+# be shortened: at 8000 steps nothing has entered the window yet.
+#
+# Secondary: `convergence_onset_propagate.csv` for WHERE each arm's window
+# falls, which is why `evaluation.intermediate_reasoning_steps` is set below.
+#
+# Kinds, and why these three:
+#   attn_residual  the community mechanism, whose author states it stabilizes
+#                  recurrence beyond 4 steps.  Adds no framework parameters.
+#   init_skip      H7 itself: gated injection of H[0] at every step.
+#   residual       h + block(h), the cheapest way to pull the map toward the
+#                  identity; the control that says whether init_skip's gain
+#                  needs the seed specifically or just a smaller step.
+#
+# `plain` is deliberately NOT in the grid: A1's three bdh_cq/propagate seeds
+# already ARE that cell.  Every field below matches a1_first_experiment.yaml
+# except `model.recurrence.kind` and the observation-only
+# `evaluation.intermediate_reasoning_steps` (excluded from the config hash for
+# that reason, see bdhx/config.py), and propagate's generator is unchanged at
+# version 0.2.0, so those runs are the reference arm and 3 jobs of GPU time do
+# not need spending twice.
+#
+# The two arms do NOT share a config hash, and nothing here should be read as
+# claiming they do: `experiment.name` and `experiment.tags` are stamped per
+# sweep and are hashed, so A4's plain arm would be a9bb3a1ff517 against A1's
+# f0b8b7c55f92.  They are matched on training content, not on hash --
+# tests/test_configs_stage_a.py pins exactly that, and fails if any modelling
+# field here drifts from A1, which is the event that would make the reuse
+# invalid.
+#
+# Cost, measured rather than profiled.  A1's bdh_cq/propagate seeds took
+# 3030 s of training for 40000 steps; the pilot puts attn_residual at 1.26x
+# and init_skip at 1.20x that per step, and residual is bounded by init_skip.
+# That is 9.2 GPU-hours of training over 9 jobs, plus ~0.35 h of evaluation
+# and ~0.98 h of pod startup at the 6.5 min/pod the pilot measured: about
+# 10.6 billed GPU-hours, ~$7.80 at the 4090 SECURE rate of $0.74/hr, ~$10.20
+# with the 1.3x contingency.  `runpod_launch.py estimate` will quote far more
+# because the manifest's est_gpu_minutes come from profiling that the pilot
+# showed to be roughly 6x conservative; prefer the measured number and keep
+# the contingency.
+sweep:
+  name: a4_convergence
+  stage: A
+  description: >
+    bdh_cq on propagate with three recurrence update rules against A1's plain
+    arm; does any of them learn the task AND keep the fixed point its plain
+    loop loses while acquiring it?
+base: configs/base/default.yaml
+grid:
+  model.recurrence.kind: [attn_residual, init_skip, residual]
+  task.name: [propagate]
+seeds: [1, 2, 3]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 40000
+  training.batch_size: 64
+  training.precision: bf16
+  reasoning.train_steps: [1, 2, 4]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+  # R=16 keeps the mid-training curve comparable to A1's plain arm cell for
+  # cell; R=32 is the depth the primary metric is read at, and A1 could not
+  # say when its plain arm's R=32 loop stopped settling because the default
+  # (1, 4, 16) never measured R=32 before the final checkpoint. Observation
+  # only: excluded from the config hash, so this stays A1's arm.
+  evaluation.intermediate_reasoning_steps: [1, 4, 16, 32]
+  evaluation.diagnostics: true
+controls:
+  # init_skip and residual add at most one width-sized gate vector -- about
+  # 0.03 percent of a 10M budget, an order of magnitude inside the 5 percent
+  # matching tolerance of EXPERIMENT_PLAN section 8 -- and the width solver
+  # already absorbs them.  A matched control would cost 3 more jobs to
+  # equalize a difference smaller than the seed spread.  C1 keeps them for
+  # the kinds that really do add parameters (step_emb, adapter).
+  matched_controls: false
+notes: >
+  R_train stays at {1, 2, 4} on purpose: this sweep must be comparable to A1
+  cell for cell, and changing what the model trains on at the same time as
+  the update rule would confound the two.  A2's curriculum is the separate
+  variable and should be run after this, as the control that shows whether
+  moving the trained R moves `cos_last` at all.

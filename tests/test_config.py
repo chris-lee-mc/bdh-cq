@@ -91,3 +91,52 @@ def test_config_is_frozen(tiny_cfg):
     cfg = tiny_cfg()
     with pytest.raises(ValidationError):
         cfg.training.steps = 1
+
+
+def test_intermediate_reasoning_steps_does_not_change_the_config_hash(tmp_path):
+    """Regression: it selects what the mid-training checkpoints OBSERVE.
+
+    Observation does not touch the trained model -- `run_evaluation` runs under
+    no_grad, restores the train/eval mode, resets the context and draws its
+    episodes from `task_rng` rather than global RNG -- so two runs differing
+    only in this field are the same experiment. Hashing it would have renamed
+    every a1_first_experiment arm (f0b8b7c55f92 became 108c9686ec9f) and broken
+    the cell-for-cell identity a4_convergence relies on to reuse A1's plain
+    runs as its reference arm.
+    """
+    from bdhx.config import Config, config_hash
+
+    base = {
+        "experiment": {"name": "x", "stage": "A"},
+        "model": {"name": "bdh_cq"},
+        "task": {"name": "propagate"},
+        "training": {"steps": 100, "batch_size": 4},
+        "evaluation": {"reasoning_steps": [1, 4, 16, 32]},
+    }
+    plain = Config.model_validate(base)
+    deep = Config.model_validate(
+        {
+            **base,
+            "evaluation": {
+                "reasoning_steps": [1, 4, 16, 32],
+                "intermediate_reasoning_steps": [1, 4, 32],
+            },
+        }
+    )
+    assert deep.evaluation.intermediate_reasoning_steps == [1, 4, 32]
+    assert config_hash(plain) == config_hash(deep)
+
+
+def test_a_real_evaluation_change_still_changes_the_hash():
+    """The exclusion above must not be read as 'evaluation does not count'."""
+    from bdhx.config import Config, config_hash
+
+    base = {
+        "experiment": {"name": "x", "stage": "A"},
+        "model": {"name": "bdh_cq"},
+        "task": {"name": "propagate"},
+        "training": {"steps": 100, "batch_size": 4},
+    }
+    a = Config.model_validate({**base, "evaluation": {"reasoning_steps": [1, 4]}})
+    b = Config.model_validate({**base, "evaluation": {"reasoning_steps": [1, 4, 32]}})
+    assert config_hash(a) != config_hash(b)

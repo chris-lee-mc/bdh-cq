@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -15,16 +16,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.runpod_launch import (
     DEFAULT_RATES_FILE,
     ManifestJob,
+    PodRecord,
+    append_state,
     build_docker_args,
     collect,
     estimate,
     launch,
+    print_status,
     read_manifest,
     reap,
+    reap_stuck_boots,
     relaunch,
     status,
     watchdog,
 )
+
+# launch() requires a committed sweep YAML: the pod regenerates the gitignored
+# generated/exp_NNN.yaml files from it.  Any real one will do here.
+SWEEP_YAML = "configs/stage_a/a1_first_experiment.yaml"
 
 
 def write_manifest(dir_: Path, rows: list[dict]) -> Path:
@@ -161,14 +170,27 @@ def test_rates_file_has_verified_a5000_and_4090():
 def test_launch_refuses_above_thresholds_without_allow_large_sweep(tmp_path):
     d = three_job_manifest(tmp_path, minutes=1000.0)  # 3 jobs * ~16.7h = way over 20h
     with pytest.raises(ValueError, match="allow-large-sweep"):
-        launch(d, git_ref="deadbeef", client=FakeRunpod(), state_path=tmp_path / "state.jsonl")
+        launch(
+            d,
+            git_ref="deadbeef" * 5,
+            client=FakeRunpod(),
+            state_path=tmp_path / "state.jsonl",
+            sweep_config_path=SWEEP_YAML,
+        )
 
 
 def test_launch_creates_pods_and_appends_state_before_returning(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="deadbeef", max_concurrent=2, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="deadbeef" * 5,
+        max_concurrent=2,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(created) == 3
     launched = [r for r in created if r.pod_id]
     queued = [r for r in created if not r.pod_id]
@@ -183,8 +205,86 @@ def test_launch_creates_pods_and_appends_state_before_returning(tmp_path):
 def test_launch_dry_run_creates_no_pods(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
-    launch(d, git_ref="deadbeef", client=client, state_path=tmp_path / "state.jsonl", dry_run=True)
+    launch(
+        d,
+        git_ref="deadbeef" * 5,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(client.pods) == 0
+
+
+def test_launch_survives_one_create_pod_failure_and_queues_it(tmp_path):
+    """Regression test: a single provisioning failure (e.g. transient GPU
+    capacity contention, hit repeatedly against the live API this session)
+    used to crash launch() entirely, losing every job after it in the batch.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    calls = {"n": 0}
+    real_create_pod = client.create_pod
+
+    def flaky_create_pod(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("There are no longer any instances available")
+        return real_create_pod(**kwargs)
+
+    client.create_pod = flaky_create_pod
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert len(created) == 3  # all 3 jobs accounted for, none dropped
+    launched = [r for r in created if r.pod_id]
+    queued = [r for r in created if not r.pod_id]
+    assert len(launched) == 2  # 2nd and 3rd create_pod calls succeeded
+    assert len(queued) == 1  # 1st call failed -- queued for relaunch, not lost
+
+
+def test_relaunch_survives_one_create_pod_failure(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
+
+    calls = {"n": 0}
+    real_create_pod = client.create_pod
+
+    def flaky_create_pod(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("no instances available")
+        return real_create_pod(**kwargs)
+
+    client.create_pod = flaky_create_pod
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert len(relaunched) == 1  # first attempt failed and was skipped, not raised
+    rows = status(state_path, client=client)
+    states = {r["run_id"]: r["state"] for r in rows}
+    assert list(states.values()).count("RUNNING") == 1
+    assert list(states.values()).count("QUEUED") == 2  # the failed one stays retryable
 
 
 def test_gql_escape_round_trips_through_naive_fstring_embedding():
@@ -212,13 +312,36 @@ def test_launch_passes_escaped_docker_args_to_create_pod(tmp_path):
     """
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
-    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=tmp_path / "state.jsonl")
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        sweep_config_path=SWEEP_YAML,
+    )
     sent = client.last_create_kwargs["docker_args"]
     decoded = json.loads(
         f'"{sent}"'
     )  # what the SDK's naive f'"{docker_args}"' effectively parses to
     assert "bash -lc" in decoded and "pip install" in decoded
     assert '"' in decoded  # the raw script does contain quotes -- that's what broke it unescaped
+
+
+def test_launch_threads_sweep_config_path_into_the_startup_command(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=tmp_path / "state.jsonl",
+        sweep_config_path=SWEEP_YAML,
+    )
+    sent = client.last_create_kwargs["docker_args"]
+    decoded = json.loads(f'"{sent}"')
+    assert "generate_sweep.py configs/stage_a/a1_first_experiment.yaml" in decoded
 
 
 def test_docker_args_never_contains_api_key():
@@ -233,10 +356,146 @@ def test_docker_args_never_contains_api_key():
         cloud_type="COMMUNITY",
         max_seconds=100,
         config_path="cfg.yaml",
+        sweep_config_path=SWEEP_YAML,
     )
-    args = build_docker_args(rec, "deadbeef")
+    args = build_docker_args(rec, "deadbeef" * 5)
     assert "RUNPOD_API_KEY" not in args
     assert "h0_s1" in args and "cfg.yaml" in args
+
+
+def test_docker_args_checks_out_fetch_head_not_the_literal_git_ref():
+    """Regression test: found live on the real A1 sweep. `git clone --depth N`
+    defaults to --single-branch, so a fresh pod clone never has a
+    remote-tracking ref for anything but the repo's default branch; a plain
+    `git fetch origin <branch>` only updates FETCH_HEAD, not
+    refs/remotes/origin/<branch>. So `git checkout {git_ref}` failed with
+    "pathspec ... did not match any file(s)" for every branch-name git_ref
+    (a raw commit SHA happened to work, since the object is present after any
+    fetch) -- and because the whole git+pip chain is one big semicolon-joined
+    statement, that failure was swallowed and every job crashed instead with
+    ModuleNotFoundError on the very first import in run_experiment.py.
+    """
+    from tools.runpod_launch import PodRecord
+
+    rec = PodRecord(
+        sweep="s",
+        exp="exp_000",
+        run_id="h0_s1",
+        pod_id=None,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=100,
+        config_path="cfg.yaml",
+        sweep_config_path=SWEEP_YAML,
+    )
+    args = build_docker_args(rec, "claude/some-branch-name")
+    assert "git fetch origin claude/some-branch-name && git checkout FETCH_HEAD" in args
+    assert "git checkout claude/some-branch-name" not in args
+
+
+def test_docker_args_regenerates_the_sweep_when_sweep_config_path_is_set():
+    """Regression test: generated/ is gitignored, so a pod's fresh clone
+    never has cfg.config_path on disk. Found live: the first real sweep job
+    failed with FileNotFoundError on exactly this path. build_docker_args
+    must regenerate it on the pod when sweep_config_path is given.
+    """
+    from tools.runpod_launch import PodRecord
+
+    rec = PodRecord(
+        sweep="a1_first_experiment",
+        exp="exp_000",
+        run_id="h0_s1",
+        pod_id=None,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=100,
+        config_path="generated/a1_first_experiment/exp_000.yaml",
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
+    )
+    args = build_docker_args(rec, "deadbeef" * 5)
+    assert "tools/generate_sweep.py configs/stage_a/a1_first_experiment.yaml" in args
+    assert "--out generated/a1_first_experiment" in args
+    # the regen step must run before run_experiment.py reads its output
+    assert args.index("generate_sweep.py") < args.index("run_experiment.py")
+
+
+def test_docker_args_refuses_a_record_without_a_sweep_config_path():
+    """The inverse of the old backward-compat test, which had it backwards.
+
+    That test asserted a PodRecord with no sweep_config_path quietly produces a
+    command with no regen step. That is precisely the command the burned pilot
+    pods ran: the pod's fresh clone has no generated/exp_NNN.yaml, so the job
+    dies on boot and the pod bills anyway. A record without the path is never
+    one to launch, so building its command now raises.
+    """
+    rec = PodRecord(
+        sweep="s",
+        exp="exp_000",
+        run_id="h0_s1",
+        pod_id=None,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=100,
+        config_path="cfg.yaml",
+    )
+    with pytest.raises(ValueError, match="sweep_config_path is required"):
+        build_docker_args(rec, "deadbeef" * 5)
+
+
+def test_relaunch_refuses_without_a_sweep_config_path(tmp_path):
+    """Regression: relaunch() bypassed launch()'s guard entirely.
+
+    It builds its own PodRecord and calls create_pod() directly, taking
+    sweep_config_path from the state row -- and runpod_state.jsonl still holds
+    the burned pilot's rows with that field empty. One
+    `runpod_launch.py relaunch generated/a1c_compose_pilot --git-ref <sha>`
+    would have re-created the identical $8.93 failure.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
+    with pytest.raises(ValueError, match="sweep_config_path is required"):
+        relaunch(d, git_ref="x", state_path=state_path, client=client)
+    assert client.last_create_kwargs == {}
+
+
+def test_relaunch_ignores_an_empty_path_on_a_pre_guard_state_row(tmp_path):
+    """The explicit argument wins; the stale row is never trusted."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
+    rows = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["sweep_config_path"] = ""  # what the burned pilot's rows look like
+    state_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert "generate_sweep.py" in json.loads(f'"{client.last_create_kwargs["docker_args"]}"')
 
 
 # -- status / relaunch / watchdog ----------------------------------------
@@ -246,7 +505,14 @@ def test_status_classifies_running_queued_missing(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=2, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     # kill one launched pod out from under the launcher (simulates preemption)
     dead_pod_id = created[0].pod_id
     del client.pods[dead_pod_id]
@@ -262,8 +528,22 @@ def test_relaunch_fills_freed_slots(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
-    r = relaunch(d, git_ref="x", max_concurrent=2, state_path=state_path, client=client)
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    r = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=2,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     assert len(r) == 1
     rows = status(state_path, client=client)
     running = [row for row in rows if row["state"] == "RUNNING"]
@@ -274,14 +554,77 @@ def test_relaunch_resumes_same_run_id_after_missing_pod(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     del client.pods[created[0].pod_id]  # preempted
-    relaunch(d, git_ref="x", max_concurrent=1, state_path=state_path, client=client)
+    relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
     rows = status(state_path, client=client)
     row = next(r for r in rows if r["run_id"] == created[0].run_id)
     assert row["state"] == "RUNNING"
     # relaunch used the SAME run_id, so --resume in build_docker_args resumes it
     assert row["run_id"] == created[0].run_id
+
+
+def test_relaunch_ignores_queued_jobs_from_a_different_sweep(tmp_path):
+    """Regression test: relaunch() used to consider every QUEUED/MISSING
+    record in the whole state file, so an unrelated sweep's (or a one-off
+    verification pod's) queued record could win a relaunch slot ahead of
+    this sweep's own job sitting right behind it in the queue. Found live
+    while launching the real A1 sweep: a stale verification-pod record
+    (a GPU type with no stock) grabbed the only slot and the real job never
+    got tried that round.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    # queue a job under an unrelated sweep name, positioned first in the file
+    append_state(
+        PodRecord(
+            sweep="other_sweep",
+            exp="exp_000",
+            run_id="other_h0_s0",
+            pod_id=None,
+            gpu_type="g",
+            cloud_type="COMMUNITY",
+            max_seconds=600,
+            config_path="generated/other_sweep/exp_000.yaml",
+            name="bdhx-other_sweep-exp_000",
+        ),
+        state_path,
+    )
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=0,
+        client=client,
+        state_path=state_path,
+        dry_run=True,
+        sweep_config_path=SWEEP_YAML,
+    )
+
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert len(relaunched) == 1
+    assert relaunched[0].sweep == "toy_sweep"  # not the other sweep's job
 
 
 def test_watchdog_terminates_pods_over_grace_period(tmp_path):
@@ -290,6 +633,7 @@ def test_watchdog_terminates_pods_over_grace_period(tmp_path):
     state_path = tmp_path / "state.jsonl"
     created = launch(
         d,
+        sweep_config_path=SWEEP_YAML,
         git_ref="x",
         max_concurrent=1,
         max_wall_clock_minutes=10,
@@ -309,6 +653,7 @@ def test_watchdog_leaves_pods_within_grace_period(tmp_path):
     state_path = tmp_path / "state.jsonl"
     created = launch(
         d,
+        sweep_config_path=SWEEP_YAML,
         git_ref="x",
         max_concurrent=1,
         max_wall_clock_minutes=10,
@@ -319,6 +664,103 @@ def test_watchdog_leaves_pods_within_grace_period(tmp_path):
     pod["uptimeSeconds"] = 10 * 60 * 1.2  # under 1.5x
     terminated = watchdog(state_path, client=client)
     assert terminated == []
+
+
+# -- reap_stuck_boots ------------------------------------------------------
+
+
+def _backdated_record(client, run_id="h0_s0", age_seconds=900, booted=True):
+    """A pod created `age_seconds` ago via create_pod, its state record backdated."""
+    pod = client.create_pod(name=f"bdhx-toy-{run_id}")
+    pod_id = pod["id"]
+    if not booted:
+        client.pods[pod_id]["runtime"]["ports"] = []
+    import time
+
+    rec = PodRecord(
+        sweep="toy",
+        exp="exp_000",
+        run_id=run_id,
+        pod_id=pod_id,
+        gpu_type="g",
+        cloud_type="COMMUNITY",
+        max_seconds=600,
+        config_path="generated/toy/exp_000.yaml",
+        name=f"bdhx-toy-{run_id}",
+        created_at=time.time() - age_seconds,
+        sweep_config_path=SWEEP_YAML,
+    )
+    return rec, pod_id
+
+
+def test_reap_stuck_boots_requeues_pods_past_grace_with_no_ports(tmp_path):
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    rec, pod_id = _backdated_record(client, age_seconds=900, booted=False)
+    append_state(rec, state_path)
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == [rec.run_id]
+    assert pod_id not in client.pods  # terminated
+
+    rows = status(state_path, client=client)
+    assert [r["state"] for r in rows if r["run_id"] == rec.run_id] == ["QUEUED"]
+
+
+def test_reap_stuck_boots_leaves_recently_created_pods_alone(tmp_path):
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    rec, pod_id = _backdated_record(client, age_seconds=30, booted=False)
+    append_state(rec, state_path)
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == []
+    assert pod_id in client.pods  # left running -- still within the boot grace window
+
+
+def test_reap_stuck_boots_leaves_booted_pods_alone_regardless_of_age(tmp_path):
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    rec, pod_id = _backdated_record(client, age_seconds=99999, booted=True)
+    append_state(rec, state_path)
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == []
+    assert pod_id in client.pods
+
+
+def test_reap_stuck_boots_then_relaunch_picks_up_the_same_run_id(tmp_path):
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    stuck_run_id = created[0].run_id
+    client.pods[created[0].pod_id]["runtime"]["ports"] = []
+    # backdate the just-launched record past the grace window
+    rows = [json.loads(line) for line in state_path.read_text().splitlines()]
+    rows[0]["created_at"] -= 900
+    state_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    requeued = reap_stuck_boots(state_path, client=client, boot_grace_seconds=600)
+    assert requeued == [stuck_run_id]
+
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert len(relaunched) == 1
+    assert relaunched[0].run_id == stuck_run_id  # same run_id -- --resume still applies
 
 
 # -- reap -----------------------------------------------------------------
@@ -367,7 +809,14 @@ def test_collect_skips_missing_pods_without_crashing(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     del client.pods[created[0].pod_id]
     result = collect(d, tmp_path / "out", state_path=state_path, client=client)
     assert result["pulled"] == []
@@ -378,7 +827,14 @@ def test_collect_skips_when_fetch_fails(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
 
     def failing_fetch(url, dest):
         return False
@@ -395,7 +851,14 @@ def test_collect_fetches_and_extracts_tarball(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
     run_id = created[0].run_id
 
     def fake_fetch(url, dest):
@@ -415,11 +878,63 @@ def test_collect_fetches_and_extracts_tarball(tmp_path):
     assert not (out_dir / f"{run_id}.tar.gz").exists()  # tarball cleaned up
 
 
+def test_collect_flattens_the_double_nested_run_dir(tmp_path):
+    """Regression test: build_docker_args()'s --out is /workspace/runs/<run_id>,
+    but run_experiment.py's own main() does `Path(args.out) / run_id`, so the
+    tarball actually contains <run_id>/<run_id>/results.json, one level
+    deeper than aggregate_results.py's walk_runs() looks
+    (`results_root.glob("*/results.json")`, exactly one level). Found live:
+    the first 3 jobs the real A1 sweep collected were nested this way and
+    would have been silently dropped from every report.
+    """
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    run_id = created[0].run_id
+
+    def fake_fetch(url, dest):
+        # what the pod's `tar czf <run_id>.tar.gz <run_id>` actually produces:
+        # <run_id>/<run_id>/... , not <run_id>/...
+        src = tmp_path / "src" / run_id / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text('{"exact_match": 1.0}')
+        (src / "checkpoints").mkdir()
+        (src / "checkpoints" / "step_00001000.pt").write_bytes(b"fake")
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(tmp_path / "src" / run_id, arcname=run_id)
+        return True
+
+    out_dir = tmp_path / "out"
+    result = collect(d, out_dir, state_path=state_path, client=client, fetch=fake_fetch)
+    assert result["pulled"] == [run_id]
+    # flattened: results.json directly under out_dir/<run_id>/, not nested
+    assert (out_dir / run_id / "results.json").read_text() == '{"exact_match": 1.0}'
+    assert (out_dir / run_id / "checkpoints" / "step_00001000.pt").exists()
+    assert not (out_dir / run_id / run_id).exists()  # nested dir removed
+
+
 def test_collect_terminate_on_collect_only_after_success(tmp_path):
     d = three_job_manifest(tmp_path)
     client = FakeRunpod()
     state_path = tmp_path / "state.jsonl"
-    created = launch(d, git_ref="x", max_concurrent=1, client=client, state_path=state_path)
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
 
     def failing_fetch(url, dest):
         return False
@@ -433,6 +948,106 @@ def test_collect_terminate_on_collect_only_after_success(tmp_path):
         terminate_on_collect=True,
     )
     assert created[0].pod_id in client.pods  # not terminated: nothing was collected
+
+
+def test_collect_marks_the_run_done_so_relaunch_does_not_retrain_it(tmp_path):
+    """Regression test: found live on the real A1 sweep. `status()` used to
+    have no terminal state -- a pod terminated by `collect(terminate_on_collect
+    =True)` then reads back as MISSING (get_pod() fails to resolve it), which
+    is exactly the state relaunch() treats as needing a retry. Three already-
+    collected A1 jobs got brand-new pods created for them, and were retrained
+    from scratch, on the very next relaunch() call.
+    """
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    run_id = created[0].run_id
+
+    def fake_fetch(url, dest):
+        src = tmp_path / "src" / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text('{"exact_match": 1.0}')
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(src, arcname=run_id)
+        return True
+
+    result = collect(
+        d,
+        tmp_path / "out",
+        state_path=state_path,
+        client=client,
+        fetch=fake_fetch,
+        terminate_on_collect=True,
+    )
+    assert result["pulled"] == [run_id]
+    assert created[0].pod_id not in client.pods  # terminated, as requested
+
+    rows = status(state_path=state_path, client=client)
+    done_row = next(r for r in rows if r["run_id"] == run_id)
+    assert done_row["state"] == "DONE"
+
+    # max_concurrent=1 means the other two manifest jobs are legitimately
+    # still QUEUED (never launched in the first place) and relaunch() is
+    # right to backfill the slot the DONE job's termination freed up -- the
+    # bug this test guards against is the DONE job itself getting relaunched.
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert run_id not in [r.run_id for r in relaunched]  # not retrained
+
+
+def test_reap_stuck_boots_leaves_done_runs_alone(tmp_path):
+    """A DONE run's pod is already terminated; reap_stuck_boots must not
+    requeue it just because it looks old with no booted ports."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    run_id = created[0].run_id
+    append_state(
+        PodRecord(
+            sweep=d.name,
+            exp=created[0].exp,
+            run_id=run_id,
+            pod_id=created[0].pod_id,
+            gpu_type=created[0].gpu_type,
+            cloud_type=created[0].cloud_type,
+            max_seconds=created[0].max_seconds,
+            config_path=created[0].config_path,
+            created_at=0.0,  # far in the past
+            done=True,
+        ),
+        state_path,
+    )
+    del client.pods[created[0].pod_id]  # collect() would have terminated it
+
+    requeued = reap_stuck_boots(state_path=state_path, client=client, boot_grace_seconds=1)
+    assert requeued == []
+
+    rows = status(state_path=state_path, client=client)
+    assert next(r for r in rows if r["run_id"] == run_id)["state"] == "DONE"
 
 
 def test_pod_proxy_url_format():
@@ -450,3 +1065,394 @@ def test_read_manifest_run_id_matches_config_hash_and_seed(tmp_path):
     jobs = read_manifest(d)
     assert jobs[0].run_id == "h0_s0"
     assert all(isinstance(j, ManifestJob) for j in jobs)
+
+
+# -- the A1c/A4 pilot burn: two guards that were not there ------------------
+
+
+def test_launch_refuses_without_a_sweep_config_path(tmp_path):
+    """Regression: the A1c/A4 pilot was launched without --sweep-config-path.
+
+    generated/ is gitignored, so every one of the six pods failed seconds
+    after boot with FileNotFoundError on generated/<sweep>/exp_NNN.yaml. A
+    crashed job still tars its output and sleeps, and RunPod keeps a pod
+    allocated after its docker command exits, so all six kept billing at
+    $0.74/hr until they were reaped by hand 2.2 hours later -- about $8.90
+    for no science. The flag was optional and the failure silent; both are
+    fixed.
+    """
+    d = three_job_manifest(tmp_path)
+    with pytest.raises(ValueError, match="sweep_config_path is required"):
+        launch(d, git_ref="x", client=FakeRunpod(), state_path=tmp_path / "state.jsonl")
+
+
+def test_launch_refuses_a_sweep_config_path_that_is_not_in_the_repo(tmp_path):
+    """The pod resolves the path inside its own clone, so it must be committed."""
+    d = three_job_manifest(tmp_path)
+    with pytest.raises(ValueError, match="does not exist in the repo"):
+        launch(
+            d,
+            git_ref="x",
+            client=FakeRunpod(),
+            state_path=tmp_path / "state.jsonl",
+            sweep_config_path="configs/stage_a/not_a_real_sweep.yaml",
+        )
+
+
+def test_watchdog_falls_back_to_created_at_when_the_api_reports_no_uptime(tmp_path):
+    """Regression: every pilot pod came back with no `uptimeSeconds` at all.
+
+    `runtime` was populated (ports were bound, so the pod HAD booted), but
+    `uptimeSeconds` was absent for the pod's whole life. watchdog() read that
+    as "no information" and skipped the pod, so a 90-minute cap never fired.
+    The launcher writes `created_at` itself, so it always has a wall-clock
+    lower bound to fall back on.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        max_wall_clock_minutes=10,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    pod = client.pods[created[0].pod_id]
+    pod.pop("uptimeSeconds")
+    # created_at is now, so nothing is over the limit yet
+    assert watchdog(state_path, client=client) == []
+    # rewrite the state with a creation time well past 1.5 x the 10-minute cap
+    rows = [json.loads(line) for line in state_path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["created_at"] = time.time() - 40 * 60
+    state_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert watchdog(state_path, client=client) == [created[0].pod_id]
+
+
+def test_print_status_estimates_cost_without_uptime(tmp_path, capsys):
+    """ "$0.000 so far" for 2.2 hours is how the burn stayed invisible."""
+    rows = [
+        {
+            "run_id": "r1",
+            "pod_id": "pod-1",
+            "state": "RUNNING",
+            "created_at": time.time() - 3600,
+            "pod": {"id": "pod-1", "costPerHr": 0.74},
+        }
+    ]
+    print_status(rows)
+    out = capsys.readouterr().out
+    assert "$0.74" in out and "(est.)" in out
+
+
+def test_status_surfaces_a_job_that_already_exited(tmp_path, capsys):
+    """A pod whose job crashed looks RUNNING to the API; the exit code says otherwise."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    rows = status(state_path, client=client, check_exit_codes=True, fetch=lambda url, t: "1\n")
+    running = [r for r in rows if r["state"] == "RUNNING"]
+    assert running and running[0]["exit_code"] == 1
+    print_status(rows)
+    assert "job exited 1, awaiting collect" in capsys.readouterr().out
+
+
+def test_status_leaves_exit_code_unset_while_the_job_is_still_running(tmp_path):
+    """EXIT_CODE is not written until run_experiment.py returns."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    rows = status(state_path, client=client, check_exit_codes=True, fetch=lambda url, t: None)
+    running = [r for r in rows if r["state"] == "RUNNING"]
+    assert running and running[0]["exit_code"] is None
+
+
+def test_watchdog_leaves_a_finished_but_uncollected_pod_alone(tmp_path):
+    """The pod holds the only copy of the run directory until collect fetches it."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        max_wall_clock_minutes=10,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert watchdog(state_path, client=client) == []
+    assert client.terminated == []
+
+
+def test_status_marks_a_pod_unknown_when_the_api_listing_fails(tmp_path):
+    """Regression: an API blip read as MISSING made relaunch duplicate a live pod.
+
+    relaunch() treats MISSING as retryable, and the new state row it appends
+    erases the original pod_id (latest_state_by_run_id keeps only the last), so
+    the first pod becomes invisible to watchdog, status, collect and
+    reap_stuck_boots -- billing on with only `reap --prefix` able to find it.
+    """
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    pod_id = created[0].pod_id
+
+    def blip(_):
+        raise RuntimeError("503 from the API")
+
+    client.get_pod = blip
+    client.get_pods = blip
+    rows = {r["run_id"]: r["state"] for r in status(state_path, client=client)}
+    assert rows[created[0].run_id] == "UNKNOWN"
+
+    # UNKNOWN is not retryable, so the live run keeps its pod and its state row
+    # (the two QUEUED jobs of this manifest are still retried, as they should be)
+    relaunched = relaunch(
+        d,
+        git_ref="x",
+        max_concurrent=3,
+        state_path=state_path,
+        client=client,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert created[0].run_id not in [r.run_id for r in relaunched]
+    from tools.runpod_launch import latest_state_by_run_id
+
+    assert latest_state_by_run_id(state_path)[created[0].run_id]["pod_id"] == pod_id
+    assert pod_id in client.pods
+
+
+def test_status_still_reports_missing_when_the_listing_succeeds(tmp_path):
+    """A pod absent from a listing that itself worked really is gone."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    client.pods.pop(created[0].pod_id)  # reaped
+    rows = {r["run_id"]: r["state"] for r in status(state_path, client=client)}
+    assert rows[created[0].run_id] == "MISSING"
+
+
+def test_http_text_survives_a_missing_curl(monkeypatch):
+    """Regression: FileNotFoundError escaped and emptied the whole status table."""
+    from tools.runpod_launch import _http_text
+
+    def no_curl(*a, **k):
+        raise FileNotFoundError(2, "No such file or directory: 'curl'")
+
+    monkeypatch.setattr("subprocess.run", no_curl)
+    assert _http_text("https://example.invalid/EXIT_CODE") is None
+
+
+def _truncated_tarball(tmp_path, run_id: str) -> bytes:
+    """A .tar.gz that OPENS cleanly but fails partway through extraction.
+
+    This is the shape a cut-off download actually takes, and the reason the
+    naive corrupt-bytes fixture is useless here: garbage after a gzip magic
+    number fails in tarfile.open() as a ReadError, which IS a TarError and was
+    already handled. A real truncation gets far enough for the first member
+    header to decompress, then dies inside copyfileobj with a zlib.error.
+    """
+    import os
+    import tarfile
+
+    src = tmp_path / "trunc_src" / run_id
+    src.mkdir(parents=True, exist_ok=True)
+    # Incompressible, so the gzip stream stays long enough to cut in half.
+    (src / "checkpoint.pt").write_bytes(os.urandom(2_000_000))
+    whole = tmp_path / f"{run_id}-whole.tar.gz"
+    with tarfile.open(whole, "w:gz") as tf:
+        tf.add(src, arcname=run_id)
+    return whole.read_bytes()[: len(whole.read_bytes()) // 2]
+
+
+def test_truncated_tarball_fixture_really_fails_during_extraction(tmp_path):
+    """Guard the guard: if this ever fails at open() instead, the two
+    regression tests below stop testing anything, because a ReadError was
+    caught by the old code too."""
+    import tarfile
+
+    path = tmp_path / "t.tar.gz"
+    path.write_bytes(_truncated_tarball(tmp_path, "r1"))
+    with tarfile.open(path) as tf, pytest.raises(Exception) as exc:  # open must NOT raise
+        tf.extractall(tmp_path / "out", filter="data")
+    assert not isinstance(exc.value, tarfile.TarError), (
+        f"fixture raised {type(exc.value).__name__}, which the old handler already caught"
+    )
+
+
+def test_collect_survives_a_truncated_download_and_still_collects_the_rest(tmp_path):
+    """A corrupt tarball must not abort collection of the runs after it.
+
+    Regression test for a real incident: the disk filled mid-extract, the
+    resulting error was not a tarfile.TarError, so it propagated out of
+    collect() and every run after it went uncollected -- leaving those pods
+    alive and billing.
+    """
+    import tarfile
+
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=3,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    assert len(created) == 3
+    bad_run_id = created[0].run_id
+    bad_bytes = _truncated_tarball(tmp_path, bad_run_id)
+
+    def fetch(url, dest):
+        run_id = url.rsplit("/", 1)[-1].removesuffix(".tar.gz")
+        if run_id == bad_run_id:
+            dest.write_bytes(bad_bytes)
+            return True
+        src = tmp_path / "src" / run_id
+        src.mkdir(parents=True)
+        (src / "results.json").write_text("{}")
+        with tarfile.open(dest, "w:gz") as tf:
+            tf.add(src, arcname=run_id)
+        return True
+
+    out_dir = tmp_path / "out"
+    result = collect(d, out_dir, state_path=state_path, client=client, fetch=fetch)
+
+    assert sorted(result["pulled"]) == sorted(r.run_id for r in created[1:])
+    assert [s["run_id"] for s in result["skipped"]] == [bad_run_id]
+    assert "bad tarball" in result["skipped"][0]["reason"]
+    for rec in created[1:]:
+        assert (out_dir / rec.run_id / "results.json").exists()
+    assert not (out_dir / f"{bad_run_id}.tar.gz").exists()  # partial cleaned up
+
+
+def test_collect_leaves_the_pod_alive_when_its_tarball_is_corrupt(tmp_path):
+    """A failed collect must not terminate the pod: it holds the only copy."""
+    d = three_job_manifest(tmp_path)
+    client = FakeRunpod()
+    state_path = tmp_path / "state.jsonl"
+    created = launch(
+        d,
+        git_ref="x",
+        max_concurrent=1,
+        client=client,
+        state_path=state_path,
+        sweep_config_path=SWEEP_YAML,
+    )
+    bad_bytes = _truncated_tarball(tmp_path, created[0].run_id)
+
+    def corrupt_fetch(url, dest):
+        dest.write_bytes(bad_bytes)
+        return True
+
+    result = collect(
+        d,
+        tmp_path / "out",
+        state_path=state_path,
+        client=client,
+        fetch=corrupt_fetch,
+        terminate_on_collect=True,
+    )
+    assert result["pulled"] == []
+    assert created[0].pod_id not in client.terminated
+
+
+def test_abbreviated_sha_is_rejected_before_any_pod_is_created():
+    """An abbreviated sha is not fetchable, and fails only on the pod.
+
+    The pod runs `git fetch origin <ref> && git checkout FETCH_HEAD`. Git
+    servers serve advertised refs plus FULL object names, so a 7-char
+    abbreviation dies with "couldn't find remote ref" -- while passing every
+    local git command, which is what makes it so easy to launch. Because the
+    fetch is `&&`-joined to the pip installs, the sweep regen and the training
+    command, the whole chain short-circuits: no job.log, EXIT_CODE 1, and a
+    pod that keeps billing because a crashed job still sleeps. 15 pods went
+    that way in one call before this guard existed.
+    """
+    import pytest
+
+    from tools.runpod_launch import require_fetchable_git_ref
+
+    with pytest.raises(ValueError, match="abbreviated sha"):
+        require_fetchable_git_ref("dc6bafb")
+
+
+def test_full_shas_and_branch_names_are_accepted():
+    """The guard must not block the two forms that DO work on a pod.
+
+    A full 40-hex object name is always fetchable, and a branch or tag name is
+    advertised by the server so it fetches too. Rejecting either would make
+    the guard worse than the bug.
+    """
+    from tools.runpod_launch import require_fetchable_git_ref
+
+    full = "dc6bafb64795509088333d167bdc70ce03d99b29"
+    assert require_fetchable_git_ref(full) == full
+    assert require_fetchable_git_ref("claude/bdh-cq-gate-a-runpod-wccvfu")
+    # A branch whose name happens to be short and hex-looking is still a name,
+    # but we cannot tell it from an abbreviation, so it is rejected: the false
+    # positive is cheap (rename or pass the sha), the false negative is 15 pods.
+    with pytest.raises(ValueError):
+        require_fetchable_git_ref("abcdef")
+
+
+def test_build_docker_args_refuses_an_abbreviated_sha():
+    """The guard has to sit where pods are actually created, not only in CLI
+    parsing: build_docker_args is the one choke point both launch() and
+    relaunch() pass through."""
+    import pytest
+
+    from tools.runpod_launch import PodRecord, build_docker_args
+
+    rec = PodRecord(
+        sweep="s",
+        exp="exp_000",
+        run_id="hash_s1",
+        pod_id=None,
+        gpu_type="NVIDIA GeForce RTX 4090",
+        cloud_type="SECURE",
+        max_seconds=600,
+        config_path="generated/s/exp_000.yaml",
+        name="bdhx-s-exp_000",
+        sweep_config_path="configs/stage_a/a1_first_experiment.yaml",
+    )
+    with pytest.raises(ValueError, match="abbreviated sha"):
+        build_docker_args(rec, "dc6bafb")

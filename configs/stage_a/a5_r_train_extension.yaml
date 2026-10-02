@@ -1,0 +1,117 @@
+# Stage A, experiment A5: does the accuracy peak follow R_train_max?
+#
+# Written to replace A2 as the next sweep, because A2 as written cannot test
+# the thing it was being kept for. See "Why not A2" below.
+#
+# What A4 established (RESULTS.md section A4): BDH-CQ's latent loop can be
+# made to converge perfectly -- `residual` holds cos(H[R], H[R-1]) at 1.0000
+# at R=32 while learning the task to exact match 0.9997 -- and it still scores
+# exactly 0.000 past R_train_max=4, on every arm, every seed, every
+# difficulty. Non-convergence was a separable symptom, not the cause. So the
+# two hypotheses still standing for the collapse are:
+#
+#   H-readout   The information survives in H[R>4], but the decoder has only
+#               ever been asked to read states produced by R in {1,2,4} and
+#               fails on states from outside that set. Then the peak is a
+#               property of what was TRAINED, and it should move when the
+#               trained set moves.
+#   H-capacity  BDH-CQ cannot represent more than R_train_max compositions of
+#               the operation at all, however it is trained. Then the peak
+#               should NOT move, and training at R=8 buys nothing at R=8.
+#
+# These make opposite predictions about one manipulation -- extend the trained
+# set -- and nothing measured so far distinguishes them, because every run in
+# this project has trained on R in {1,2,4} and only ever tested outside it.
+#
+# The design is one arm and A1's reuse:
+#
+#   reasoning.train_steps: [1, 2, 4, 8]   (this sweep, 3 seeds)
+#   reasoning.train_steps: [1, 2, 4]      (A1's bdh_cq/propagate cell, 3 seeds)
+#
+# Verified matched: build_model() never passes `r_max` to the model, so it is
+# always DEFAULT_R_MAX=8 regardless of `reasoning.train_steps`, and `plain`'s
+# RecurrenceRunner adds no parameters in any case. Both settings build at
+# 10,010,880 trainable params, which is A1's f0b8b7c55f92 exactly. So this is
+# 3 jobs, not 6, on the same reuse argument A4 used -- and, as there, the two
+# do NOT share a config hash, because experiment.name and tags are hashed.
+# tests/test_configs_stage_a.py pins the match on content.
+#
+# Read the result at R=8 and R=16 on `interp`:
+#   - peak moves to R=8 and collapses at 16 -> H-readout. The collapse is
+#     "never trained there", the loop is fine, and the next question is how
+#     far the trained set has to go, not what is wrong with the recurrence.
+#   - still 0.000 at R=8 despite 25 percent of training steps being AT R=8 ->
+#     H-capacity, which is a much deeper result than anything so far: it would
+#     mean BDH-CQ cannot compose the operation more than a few times whatever
+#     it is shown, and it is the point at which the community architecture,
+#     not its training, is the finding.
+#
+# Cost, from A4's measured numbers rather than the manifest's profile. A1's
+# plain bdh_cq/propagate seeds ran at 75.8 ms/step averaged over 3 seeds. Mean
+# R per step goes from 7/3 to 15/4, a factor of 1.607, which is an upper bound
+# on the slowdown because ingest, data and the optimizer step do not scale
+# with R. That is ~81 min of training per job, plus ~6.5 min of pod boot and
+# the ~19 min final evaluation A4 measured for this R grid: ~107 min/job, 3
+# jobs, 5.35 GPU-hours, about $3.96 at the 4090 Secure rate of $0.74/hr, or
+# ~$5.15 with the 1.3x contingency. Cheaper than A4 and much cheaper than A2.
+#
+# One confound, stated rather than controlled: this arm trains on ~1.6x the
+# FLOPs of A1's, because training at R=8 is not free. It is not FLOP-matched,
+# and matching it would cost 3 more jobs. The confound is weak for the reading
+# above: A1's arm already reaches exact match 0.997 at R=4, so the task is
+# saturated inside the trained range and extra compute has nothing left to buy
+# there. It cannot manufacture a peak at R=8, which is where A1 scores 0.000.
+# If A5 comes back positive and the FLOP difference is challenged, the control
+# to add is a matched arm at ~24900 steps, not a rerun of this one.
+#
+# Why not A2 (configs/stage_a/a2_curriculum.yaml): both of A2's arms cap
+# R_train_max at 4. Its curriculum is schedule [1,2,4] over train_steps
+# [1,2,4], so `RTrainSampler.r_max` is 4 in the curriculum arm and 4 in the
+# uniform arm; the only difference the sweep creates is the share of steps
+# spent at R=4, 40 percent against 34 percent. A2 therefore tests whether the
+# ORDER of exposure matters, which is a real question but a small one, and it
+# cannot move a peak past a value it never trains. It was described in
+# RESULTS.md as the probe of whether the readout is the binding constraint.
+# It is not that probe. This file is.
+sweep:
+  name: a5_r_train_extension
+  stage: A
+  description: >
+    bdh_cq/plain on propagate trained on R in {1,2,4,8} instead of {1,2,4},
+    against A1's arm: does the accuracy peak follow R_train_max, or is it
+    pinned wherever BDH-CQ's capacity runs out?
+base: configs/base/default.yaml
+grid:
+  task.name: [propagate]
+seeds: [1, 2, 3]
+overrides:
+  model.name: bdh_cq
+  model.params_target: 10_000_000
+  model.recurrence.kind: plain
+  model.recurrence.share_weights: true
+  model.recurrence.input_injection: true
+  training.steps: 40000
+  training.batch_size: 64
+  training.precision: bf16
+  # The one manipulation. Everything else matches a1_first_experiment.yaml.
+  reasoning.train_steps: [1, 2, 4, 8]
+  reasoning.train_step_sampling: uniform
+  evaluation.reasoning_steps: [1, 2, 4, 8, 16, 32]
+  # R=8 is the new R_train_max and the value the whole sweep is read at, so it
+  # has to be in the mid-training set: the question of WHEN a peak at R=8
+  # appears is only answerable if a checkpoint before the last one measures
+  # it. Observation only, excluded from the config hash (bdhx/config.py).
+  evaluation.intermediate_reasoning_steps: [1, 4, 8, 32]
+  evaluation.diagnostics: true
+controls:
+  # No parameters are added or removed by changing train_steps (verified
+  # above: identical 10,010,880 either way), so there is nothing for a matched
+  # control to equalize. The FLOP confound is discussed in the header and is
+  # deliberately not controlled here.
+  matched_controls: false
+notes: >
+  Run this before A2. If A5 says H-readout, A2's ordering question becomes
+  worth asking as a cheap follow-up on how to spend a fixed R budget. If A5
+  says H-capacity, A2 is dead too -- reordering exposure to values inside a
+  range the model cannot exceed would not help either -- and Stage A's finding
+  is about the architecture rather than its training schedule.
